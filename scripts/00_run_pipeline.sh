@@ -22,7 +22,7 @@
 # Usage:
 #     sudo ./00_run_pipeline.sh              # everything
 #     sudo ./00_run_pipeline.sh --skip-vm    # stop after the teardown
-#     sudo ./00_run_pipeline.sh --from 07    # resume from a given step
+#     sudo ./00_run_pipeline.sh --from 07    # resume from a step (02 always runs)
 #
 # -E so the ERR trap fires from inside functions too; without it a failure in
 # step() would exit silently with no pointer to the log.
@@ -88,12 +88,24 @@ step() {
 # ---------------------------------------------------------------------------
 trap 'printf "\n\033[31mFailed. Mounts left in place for investigation:\033[0m\n  sudo chroot %s /bin/bash\nLogs: %s\n" "$MNT" "$LOG_DIR"' ERR
 
-# Sync the in-chroot scripts on every run, including when --from skips step 02.
+# Step 02 is never skipped by --from.
 #
-# --from exists to skip expensive work, not to skip keeping the chroot's copies
-# current. Skipping 02 previously meant `--from 05` re-ran whatever stale copy
-# a failed run had left in /mnt/gentoo/root/ - so a fix made on the host was
-# invisible and the same failure repeated identically.
+# It is not expensive work that a resume can jump over - it is the precondition
+# for everything that follows: it establishes the chroot mounts and copies the
+# host's scripts into them. Twice now, treating it as skippable has caused a
+# failure: once by re-running a stale copy of a script that had already been
+# fixed, and once by trying to chroot into a filesystem the previous run's
+# teardown had already unmounted.
+#
+# Re-running it is cheap and idempotent: it detects an unpacked stage3 and only
+# re-establishes the mounts.
+FROM_EFFECTIVE="$FROM"
+FROM="02"
+step 02 host 02_bootstrap_stage3.sh
+FROM="$FROM_EFFECTIVE"
+
+# Belt and braces: 02 stages these itself, but re-syncing here covers a script
+# edited between the two.
 sync_chroot_scripts() {
     mountpoint -q "$MNT" || return 0
     local staged=()
@@ -103,10 +115,10 @@ sync_chroot_scripts() {
         staged+=("$(basename "$s")")
     done
     [ "${#staged[@]}" -gt 0 ] && printf '\n\033[2m-- synced into the chroot: %s\033[0m\n' "${staged[*]}"
+    return 0
 }
 sync_chroot_scripts
 
-step 02 host   02_bootstrap_stage3.sh
 step 05 chroot 05_configure_kernel.sh
 step 06 chroot 06_nvidia_driver.sh
 step 07 chroot 07_make_bootable.sh
