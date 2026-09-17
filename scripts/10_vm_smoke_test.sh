@@ -164,13 +164,25 @@ check_log "login prompt reached"      "login:" || true
 # check has to wait for bare metal.
 echo "  [ -- ] simple-framebuffer console (not testable via -kernel boot)"
 
+# nvidia-persistenced cannot start without a GPU, and there is no GPU in the
+# VM. Call it out explicitly so it does not read as a real failure here - but
+# it would be one on bare metal.
+if grep -q "nvidia-persistenced failed" "$SERIAL_LOG"; then
+    echo "  [ -- ] nvidia-persistenced failed (expected: no GPU in the VM)"
+fi
+
 echo
 if grep -qiE "Kernel panic|Unable to mount root|VFS: Cannot open root" "$SERIAL_LOG"; then
     echo "  KERNEL PANIC - see the log above"
     grep -iE -A5 "Kernel panic|Unable to mount root|VFS: Cannot open root" "$SERIAL_LOG" | head -20
 elif grep -q "login:" "$SERIAL_LOG"; then
-    echo "  Reached a login prompt. The boot path is sound; what remains untestable"
-    echo "  here is the GPU, which needs bare metal on this machine."
+    echo "  Reached a login prompt. The boot path is sound. What is still"
+    echo "  untested here is the GPU and the FB_SIMPLE console, both of which"
+    echo "  need bare metal on this machine."
+elif grep -qE "Starting local|Starting sshd" "$SERIAL_LOG"; then
+    echo "  The default runlevel completed but no login prompt appeared on serial."
+    echo "  If 07 has not been re-run since the serial getty was added, the getty"
+    echo "  is only on tty1 and the serial port will never show one."
 else
     echo "  No login prompt within ${BOOT_TIMEOUT}s and no panic either - read"
     echo "  ${SERIAL_LOG} to see how far it got."

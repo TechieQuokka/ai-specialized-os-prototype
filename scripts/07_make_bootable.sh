@@ -110,6 +110,29 @@ fi
 # 3. sshd, so the machine is reachable once it boots.
 # Root login over SSH is enabled because root is the only account that exists.
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Serial getty.
+# Gentoo ships the serial console line in /etc/inittab commented out, so a
+# getty runs on tty1 only. That is fine on bare metal, but it means the QEMU
+# smoke test - which watches the serial port - can never see a login prompt and
+# cannot confirm the boot completed. Phase B strips the kernel further and
+# re-runs that test each round, so an automatic "still reaches login" check is
+# worth one agetty process.
+# ---------------------------------------------------------------------------
+say "Enabling a serial getty"
+readonly SERIAL_GETTY='s0:12345:respawn:/sbin/agetty -L 115200 ttyS0 vt100'
+if grep -q '^s0:.*ttyS0' /etc/inittab 2>/dev/null; then
+    echo "  already enabled"
+elif grep -q '^#s0:.*ttyS0' /etc/inittab 2>/dev/null; then
+    sed -i "s|^#s0:.*ttyS0.*|${SERIAL_GETTY}|" /etc/inittab
+    echo "  uncommented the existing ttyS0 line"
+else
+    printf '\n# Serial console, so an automated boot test can confirm login is reached.\n%s\n' \
+        "$SERIAL_GETTY" >> /etc/inittab
+    echo "  appended a ttyS0 line"
+fi
+grep -E '^(c1|s0):' /etc/inittab | sed 's/^/    /'
+
 say "Configuring sshd"
 if [ -f /etc/ssh/sshd_config ]; then
     sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
