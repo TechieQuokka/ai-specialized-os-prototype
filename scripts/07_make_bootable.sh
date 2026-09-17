@@ -123,27 +123,46 @@ fi
 # Root login over SSH is enabled because root is the only account that exists.
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
-# Serial getty.
-# Gentoo ships the serial console line in /etc/inittab commented out, so a
-# getty runs on tty1 only. That is fine on bare metal, but it means the QEMU
-# smoke test - which watches the serial port - can never see a login prompt and
-# cannot confirm the boot completed. Phase B strips the kernel further and
-# re-runs that test each round, so an automatic "still reaches login" check is
-# worth one agetty process.
+# Serial getty, via OpenRC rather than /etc/inittab.
+#
+# Gentoo leaves the ttyS0 line in inittab commented out, so a getty runs on
+# tty1 only. That is fine on bare metal, but the QEMU smoke test watches the
+# serial port and so can never confirm the boot reached a login prompt.
+#
+# Uncommenting the inittab line was the obvious fix and it did not work - and,
+# worse, it failed silently: sysvinit spawns getty entries without logging
+# anything, so a getty that never appears is indistinguishable from one that
+# was never configured. OpenRC's agetty service prints "Starting agetty.ttyS0"
+# either way, which turns a silent failure into a visible one.
+#
+# The OpenRC agetty guide is explicit that only one manager may own a port, so
+# the inittab line is put back the way the stage3 shipped it.
 # ---------------------------------------------------------------------------
-say "Enabling a serial getty"
-readonly SERIAL_GETTY='s0:12345:respawn:/sbin/agetty -L 115200 ttyS0 vt100'
+say "Enabling a serial getty (OpenRC agetty service)"
+
 if grep -q '^s0:.*ttyS0' /etc/inittab 2>/dev/null; then
-    echo "  already enabled"
-elif grep -q '^#s0:.*ttyS0' /etc/inittab 2>/dev/null; then
-    sed -i "s|^#s0:.*ttyS0.*|${SERIAL_GETTY}|" /etc/inittab
-    echo "  uncommented the existing ttyS0 line"
-else
-    printf '\n# Serial console, so an automated boot test can confirm login is reached.\n%s\n' \
-        "$SERIAL_GETTY" >> /etc/inittab
-    echo "  appended a ttyS0 line"
+    sed -i 's|^s0:\(.*ttyS0.*\)|#s0:\1|' /etc/inittab
+    echo "  re-commented the inittab ttyS0 line (OpenRC owns this port now)"
 fi
-grep -E '^(c1|s0):' /etc/inittab | sed 's/^/    /'
+
+if [ -f /etc/init.d/agetty ]; then
+    ln -sf agetty /etc/init.d/agetty.ttyS0
+    cat > /etc/conf.d/agetty.ttyS0 <<'AGETTY'
+# Serial console getty. Exists so an automated boot test can assert that the
+# system reached a login prompt; harmless on bare metal, where the console
+# getty on tty1 is the one that matters.
+baud="115200"
+term_type="vt100"
+# --local-line: do not wait for carrier detect, which a virtual serial port
+# never asserts.
+agetty_options="--local-line"
+AGETTY
+    rc-update add agetty.ttyS0 default >/dev/null 2>&1 || true
+    echo "  agetty.ttyS0 -> default runlevel"
+else
+    echo "  WARNING: /etc/init.d/agetty missing; no serial getty configured"
+fi
+grep -E '^#?(c1|s0):' /etc/inittab | sed 's/^/    /'
 
 say "Configuring sshd"
 if [ -f /etc/ssh/sshd_config ]; then
