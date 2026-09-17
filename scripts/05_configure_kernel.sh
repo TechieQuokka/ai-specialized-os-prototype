@@ -122,19 +122,35 @@ cfg --disable DRM_NOUVEAU          # conflicts with the NVIDIA driver
 cfg --disable DRM_AMDGPU
 cfg --disable DRM_I915
 cfg --disable DRM_RADEON
-# SYSFB_SIMPLEFB registers a "simple-framebuffer" platform device from what the
-# firmware handed over, but something has to claim it or there is no console at
-# all - CONFIG_FB and FRAMEBUFFER_CONSOLE on their own produce a black screen.
+# Console. CONFIG_FB and FRAMEBUFFER_CONSOLE on their own produce a black
+# screen - something has to claim the framebuffer the firmware handed over.
 #
-# FB_SIMPLE rather than DRM_SIMPLEDRM: simpledrm is the DRM-side driver and
-# would need DRM_FBDEV_EMULATION switched back on to give a text console, which
-# drags DRM_TTM_HELPER back in with it. The fbdev driver attaches straight to
-# FRAMEBUFFER_CONSOLE and is the smaller path.
+# sysfb registers one of TWO different platform devices, and which one is not
+# knowable in advance. From the kernel documentation for SYSFB_SIMPLEFB: the
+# framebuffer is advertised as "simple-framebuffer" when it is compatible with
+# the generic modes, and "if the framebuffer is not compatible with the generic
+# modes, it is advertised as fallback platform framebuffer so legacy drivers
+# like efifb, vesafb and uvesafb can pick it up".
+#
+#   simple-framebuffer  -> claimed by FB_SIMPLE
+#   efi-framebuffer     -> claimed by FB_EFI
+#
+# Both are enabled because only the firmware decides which one appears, and
+# this is the one failure that the QEMU smoke test cannot catch: -kernel boot
+# skips the firmware entirely, so no framebuffer is handed over at all and the
+# guest falls back to emulated VGA. Getting it wrong means discovering a black
+# screen on bare metal with no console to read the reason from.
+#
+# fbdev rather than DRM_SIMPLEDRM: simpledrm would need DRM_FBDEV_EMULATION
+# switched back on to provide a text console, which drags DRM_TTM_HELPER back
+# in with it per the nvidia-drivers ebuild. The fbdev drivers attach straight
+# to FRAMEBUFFER_CONSOLE.
 cfg --enable  SYSFB
 cfg --enable  SYSFB_SIMPLEFB
 cfg --enable  FB
 cfg --enable  FB_CORE
 cfg --enable  FB_SIMPLE
+cfg --enable  FB_EFI
 cfg --enable  FRAMEBUFFER_CONSOLE
 cfg --enable  VT
 cfg --enable  VT_CONSOLE
@@ -320,7 +336,10 @@ done
 # boot failure becomes unreadable - which defeats the reason for keeping the
 # console in the first place.
 echo "  --- console (so a failed boot is readable) ---"
-for o in SYSFB_SIMPLEFB FB_SIMPLE FRAMEBUFFER_CONSOLE VT_CONSOLE; do
+# FB_SIMPLE and FB_EFI both required: sysfb picks which platform device to
+# register based on the firmware's mode, and only one of the two drivers will
+# match whichever it chose.
+for o in SYSFB_SIMPLEFB FB_SIMPLE FB_EFI FRAMEBUFFER_CONSOLE VT_CONSOLE; do
     check "$o" on || failed=1
 done
 
@@ -348,6 +367,17 @@ make -s "-j${JOBS}"
 
 say "Installing modules"
 make -s "-j${JOBS}" modules_install
+
+# r8169 is built as a module, so the config check earlier only proved it was
+# selected - not that it was built and installed. Without it the machine has no
+# network at all, and that is not something to discover after rebooting into a
+# system whose only other access path is the console.
+kver="$(make -s kernelversion)-gentoo"
+if find "/lib/modules/${kver}" -name 'r8169.ko*' -print -quit 2>/dev/null | grep -q .; then
+    say "Network driver present: $(find "/lib/modules/${kver}" -name 'r8169.ko*' | head -1)"
+else
+    die "r8169.ko was not installed under /lib/modules/${kver} - the machine would boot with no network"
+fi
 
 say "Installing kernel to /boot"
 make -s install
