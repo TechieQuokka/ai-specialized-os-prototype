@@ -24,6 +24,11 @@ is the only way to answer the question the whole prototype exists for:
 1. Reboot, press **F11**, pick **`Gentoo-ML`**.
    Ubuntu is still the default boot target, so a plain reboot goes back to
    Ubuntu and a failed boot costs only a power cycle.
+
+   **If the Toshiba is not in the F11 menu at all**, its NVRAM boot entries
+   have been dropped by the firmware — see "When the disk vanishes from the
+   boot menu" below. `sudo ./scripts/12_restore_boot_entries.sh` puts them
+   back; the disk itself is almost certainly fine.
 2. Log in as `root`.
 3. ```
    git clone https://github.com/TechieQuokka/ai-specialized-os-prototype
@@ -56,6 +61,38 @@ been written to at any point in this project.
 | No `nvidia` in `lsmod` | Try `modprobe nvidia nvidia_uvm` and read the error |
 | `nvidia-smi` fails | Something is missing from the kernel config |
 | No IP from `ip a` | `rc-service dhcpcd restart` |
+
+### When the disk vanishes from the boot menu
+
+Happened on 2026-09-17, after Fast Boot was disabled in the BIOS. `Gentoo-ML`
+and `Gentoo-ML-isolcpus` were both gone from NVRAM — `BootOrder` was back to
+just `0001,0000` — and the Toshiba stopped appearing in the F11 menu entirely.
+It reads like a dead drive. It is not one.
+
+EFI boot entries live in firmware NVRAM, not on the disk, and NVRAM is not
+ours: a CMOS clear, a settings change, a firmware update or the board's own
+housekeeping can all remove them. Check before suspecting hardware — from
+Ubuntu, `lsblk` showed `sdc` with all three partitions intact, `dmesg` had no
+SATA errors, and the kernel image was still on the ESP. Nothing was wrong
+except two missing variables.
+
+```
+sudo ./scripts/12_restore_boot_entries.sh
+```
+
+It finds the disk by serial, discovers the kernel image on the ESP rather than
+assuming a version, recreates both entries, appends them to `BootOrder` so
+Ubuntu stays the default, and then reads NVRAM back to confirm each entry
+exists, points at the right ESP, carries `root=PARTUUID=` and is in
+`BootOrder`.
+
+**A fallback `\EFI\BOOT\BOOTX64.EFI` would not help, so do not add one.** Most
+firmwares will offer a disk with no NVRAM entry only if the ESP carries that
+removable-media path, which makes it a tempting fix. But this is an EFI-stub
+boot: the command line is carried in the boot entry's LoadOptions, and booting
+the fallback path passes none. The kernel would come up with no `root=`, with
+no initramfs to recover and no `CONFIG_CMDLINE` compiled in, and panic.
+Restoring the NVRAM entries is the only thing that actually boots.
 
 ---
 
@@ -122,8 +159,10 @@ it establishes the mounts and syncs the scripts into the chroot.
 | `09_gentoo_first_boot.sh` | **booted Gentoo** | Verify, install torch, benchmark |
 | `10_vm_smoke_test.sh` | host | QEMU boot test, non-destructive |
 | `11_collect_from_target.sh` | host | Read `/root/handoff` off the target |
+| `12_restore_boot_entries.sh` | host | Recreate the EFI boot entries after NVRAM loss |
 
-01, 03 and 04 are done and do not need re-running. 02 and 05–08 are idempotent.
+01, 03 and 04 are done and do not need re-running. 02, 05–08 and 12 are
+idempotent.
 
 ---
 
@@ -152,10 +191,15 @@ command line lives in the EFI boot entry, so each configuration under test gets
 its own named entry and the firmware boot menu doubles as the A/B test menu:
 
 ```
-Boot0005  Gentoo-ML            root=PARTUUID=... rw nvidia-drm.modeset=0 console=tty0
-Boot0006  Gentoo-ML-isolcpus   + isolcpus=2,3 nohz_full=2,3 rcu_nocbs=2,3
-BootOrder 0001,0000,0002,0003,0004,0005,0006      <- 0001 is Ubuntu, still first
+Boot0002  Gentoo-ML            root=PARTUUID=... rw nvidia-drm.modeset=0 console=tty0
+Boot0003  Gentoo-ML-isolcpus   + isolcpus=2,3 nohz_full=2,3 rcu_nocbs=2,3
+BootOrder 0001,0000,0002,0003                     <- 0001 is Ubuntu, still first
 ```
+
+**Refer to these by label, never by number.** The firmware assigns the number,
+and it reuses freed slots: these were `Boot0005`/`Boot0006` until the NVRAM loss
+described above, and came back as `0002`/`0003` when they were recreated. The
+label is ours and is stable.
 
 **Both `FB_SIMPLE` and `FB_EFI`.** sysfb registers `simple-framebuffer` when the
 firmware's mode is compatible with the generic modes and falls back to
