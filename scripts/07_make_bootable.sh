@@ -29,7 +29,10 @@
 #
 set -euo pipefail
 
-readonly KVER="6.18.48-gentoo"
+# Derived below from the kernel source tree rather than hardcoded - a
+# gentoo-sources bump would otherwise silently write boot entries pointing at
+# an image filename that no longer exists.
+KVER=""
 
 # root= must use PARTUUID, not the filesystem UUID.
 #
@@ -53,10 +56,19 @@ say() { printf '\n==> [%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
 [ "$(id -u)" -eq 0 ] || die "must run as root"
 [ -f /etc/gentoo-release ] || die "not inside a Gentoo chroot - refusing"
 [ -f /boot/vmlinuz ] || die "/boot/vmlinuz missing - run 05 first"
+[ -d /usr/src/linux ] || die "/usr/src/linux missing - run 05 first"
+
+# kernelrelease is the string modules_install names its directory after, and
+# the one the ESP image filename must agree with. gentoo-sources already puts
+# "-gentoo" in EXTRAVERSION, so nothing may be appended to it.
+KVER="$(make -s -C /usr/src/linux kernelrelease)"
+readonly KVER
+[ -n "$KVER" ] || die "could not determine the kernel release from /usr/src/linux"
 [ -d "/lib/modules/${KVER}" ] || die "/lib/modules/${KVER} missing - run 05 first"
-[ -f "/lib/modules/${KVER}/video/nvidia.ko" ] \
-    || find "/lib/modules/${KVER}" -name 'nvidia.ko*' -print -quit | grep -q . \
-    || die "nvidia.ko not built - run 06 first"
+find "/lib/modules/${KVER}" -name 'nvidia.ko*' -print -quit | grep -q . \
+    || die "nvidia.ko not built under /lib/modules/${KVER} - run 06 first"
+
+say "Target kernel: ${KVER}"
 
 # ---------------------------------------------------------------------------
 # 1. Root password.

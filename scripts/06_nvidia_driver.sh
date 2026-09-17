@@ -22,7 +22,6 @@
 set -euo pipefail
 
 readonly NV_VERSION="595.84"
-readonly KVER="6.18.48-gentoo"
 
 die() { printf '\nABORT: %s\n' "$*" >&2; exit 1; }
 say() { printf '\n==> [%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
@@ -31,9 +30,17 @@ say() { printf '\n==> [%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
 [ -f /etc/gentoo-release ] || die "not inside a Gentoo chroot - refusing"
 [ -d /usr/src/linux ] || die "/usr/src/linux missing - run 05 first"
 [ -f /usr/src/linux/.config ] || die "kernel is not configured - run 05 first"
-[ -d "/lib/modules/${KVER}" ] || die "/lib/modules/${KVER} missing - kernel not installed"
 
-say "Target kernel: $(make -s -C /usr/src/linux kernelversion)"
+# Derived from the source tree rather than hardcoded, and only after the tree
+# is known to exist. kernelrelease is what modules_install names the directory
+# after; gentoo-sources already carries "-gentoo" in EXTRAVERSION, so nothing
+# may be appended to it.
+KVER="$(make -s -C /usr/src/linux kernelrelease)"
+readonly KVER
+[ -n "$KVER" ] || die "could not determine the kernel release from /usr/src/linux"
+[ -d "/lib/modules/${KVER}" ] || die "/lib/modules/${KVER} missing - run 05 first"
+
+say "Target kernel: ${KVER}"
 
 # --- pin the driver version -------------------------------------------------
 say "Pinning nvidia-drivers to ${NV_VERSION}"

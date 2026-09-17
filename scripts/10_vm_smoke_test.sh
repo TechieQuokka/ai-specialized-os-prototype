@@ -43,7 +43,11 @@ readonly ESP_UUID="930F-3DE2"
 # PARTUUID, not the filesystem UUID: with no initramfs the kernel resolves
 # root= itself and can only read identifiers stored in the partition table.
 readonly ROOT_PARTUUID="3eb15fc3-858e-4b37-abe5-d43c8554799a"
-readonly KVER="6.18.48-gentoo"
+# Discovered from the ESP rather than hardcoded. This script runs on the host,
+# so it cannot ask the kernel source tree (that lives on the unmounted target),
+# and a stale version string here would silently test an image that is not the
+# one just built.
+KVER=""
 
 readonly VM_MEM="4G"
 readonly VM_CPUS="4"
@@ -88,14 +92,27 @@ esp="$(readlink -f "/dev/disk/by-uuid/${ESP_UUID}")"
 
 tmpmnt="$(mktemp -d)"
 mount -o ro "$esp" "$tmpmnt"
-kernel_src="${tmpmnt}/EFI/Gentoo/vmlinuz-${KVER}.efi"
-if [ -f "$kernel_src" ]; then
-    cp "$kernel_src" "${WORK}/vmlinuz"
-    echo "  $(ls -la "${WORK}/vmlinuz" | awk '{print $5" bytes"}')"
-else
+
+# Exactly one image is expected. More than one means a previous kernel was left
+# behind and it is no longer obvious which one the boot entries point at, so
+# say so rather than picking arbitrarily.
+mapfile -t images < <(find "${tmpmnt}/EFI/Gentoo" -maxdepth 1 -name 'vmlinuz-*.efi' 2>/dev/null | sort)
+if [ "${#images[@]}" -eq 0 ]; then
     umount "$tmpmnt"; rmdir "$tmpmnt"
-    die "kernel not found at ${kernel_src}"
+    die "no vmlinuz-*.efi under EFI/Gentoo on the ESP - run 07 first"
+elif [ "${#images[@]}" -gt 1 ]; then
+    printf '  found %d images:\n' "${#images[@]}"
+    printf '    %s\n' "${images[@]##*/}"
+    umount "$tmpmnt"; rmdir "$tmpmnt"
+    die "more than one kernel image on the ESP - remove the stale one first"
 fi
+
+kernel_src="${images[0]}"
+KVER="$(basename "$kernel_src" .efi)"; KVER="${KVER#vmlinuz-}"
+readonly KVER
+cp "$kernel_src" "${WORK}/vmlinuz"
+echo "  ${KVER}  ($(stat -c %s "${WORK}/vmlinuz") bytes)"
+
 umount "$tmpmnt"
 rmdir "$tmpmnt"
 

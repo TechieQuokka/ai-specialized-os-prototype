@@ -372,7 +372,10 @@ make -s "-j${JOBS}" modules_install
 # selected - not that it was built and installed. Without it the machine has no
 # network at all, and that is not something to discover after rebooting into a
 # system whose only other access path is the console.
-kver="$(make -s kernelversion)-gentoo"
+# kernelrelease, not kernelversion: modules_install names the directory after
+# the release string, and gentoo-sources already carries "-gentoo" in
+# EXTRAVERSION - appending it again produces 6.18.48-gentoo-gentoo.
+kver="$(make -s kernelrelease)"
 if find "/lib/modules/${kver}" -name 'r8169.ko*' -print -quit 2>/dev/null | grep -q .; then
     say "Network driver present: $(find "/lib/modules/${kver}" -name 'r8169.ko*' | head -1)"
 else
