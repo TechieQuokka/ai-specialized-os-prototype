@@ -122,8 +122,19 @@ cfg --disable DRM_NOUVEAU          # conflicts with the NVIDIA driver
 cfg --disable DRM_AMDGPU
 cfg --disable DRM_I915
 cfg --disable DRM_RADEON
+# SYSFB_SIMPLEFB registers a "simple-framebuffer" platform device from what the
+# firmware handed over, but something has to claim it or there is no console at
+# all - CONFIG_FB and FRAMEBUFFER_CONSOLE on their own produce a black screen.
+#
+# FB_SIMPLE rather than DRM_SIMPLEDRM: simpledrm is the DRM-side driver and
+# would need DRM_FBDEV_EMULATION switched back on to give a text console, which
+# drags DRM_TTM_HELPER back in with it. The fbdev driver attaches straight to
+# FRAMEBUFFER_CONSOLE and is the smaller path.
+cfg --enable  SYSFB
 cfg --enable  SYSFB_SIMPLEFB
 cfg --enable  FB
+cfg --enable  FB_CORE
+cfg --enable  FB_SIMPLE
 cfg --enable  FRAMEBUFFER_CONSOLE
 cfg --enable  VT
 cfg --enable  VT_CONSOLE
@@ -302,6 +313,14 @@ failed=0
 echo "  --- required to boot ---"
 for o in SATA_AHCI BLK_DEV_SD EXT4_FS VFAT_FS DEVTMPFS DEVTMPFS_MOUNT \
          EFI EFI_STUB EFI_PARTITION PROC_FS SYSFS TMPFS BINFMT_ELF; do
+    check "$o" on || failed=1
+done
+
+# Without a driver claiming the firmware framebuffer there is no console, and a
+# boot failure becomes unreadable - which defeats the reason for keeping the
+# console in the first place.
+echo "  --- console (so a failed boot is readable) ---"
+for o in SYSFB_SIMPLEFB FB_SIMPLE FRAMEBUFFER_CONSOLE VT_CONSOLE; do
     check "$o" on || failed=1
 done
 

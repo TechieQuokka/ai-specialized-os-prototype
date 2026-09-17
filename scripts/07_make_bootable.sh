@@ -134,9 +134,35 @@ esp_part="$(printf '%s' "$esp_dev" | grep -oE '[0-9]+$')"
 
 # The same serial guard the install scripts use: never write boot entries that
 # point at a partition on some other disk.
-actual_serial="$(lsblk -dno SERIAL "$esp_disk" | tr -d '[:space:]')"
-[ "$actual_serial" = "$TARGET_SERIAL" ] \
-    || die "ESP lives on ${esp_disk} (serial ${actual_serial}), not the expected ${TARGET_SERIAL}"
+#
+# Inside a chroot `lsblk -o SERIAL` usually comes back empty, because it reads
+# the udev database rather than sysfs. That is "could not determine", which is
+# a different thing from "determined and wrong" - only the second one justifies
+# aborting. /dev/disk/by-id encodes the serial in the symlink name and works
+# in the chroot, so try that before giving up.
+actual_serial="$(lsblk -dno SERIAL "$esp_disk" 2>/dev/null | tr -d '[:space:]')"
+
+if [ -z "$actual_serial" ]; then
+    for link in /dev/disk/by-id/*"${TARGET_SERIAL}"*; do
+        [ -e "$link" ] || continue
+        case "$link" in *-part[0-9]*) continue ;; esac
+        if [ "$(readlink -f "$link")" = "$esp_disk" ]; then
+            actual_serial="$TARGET_SERIAL"
+            break
+        fi
+    done
+fi
+
+if [ -n "$actual_serial" ]; then
+    [ "$actual_serial" = "$TARGET_SERIAL" ] \
+        || die "ESP lives on ${esp_disk} (serial ${actual_serial}), not the expected ${TARGET_SERIAL}"
+    echo "  disk serial verified: ${actual_serial}"
+else
+    # The ESP UUID was already checked against ESP_UUID above, which pins the
+    # exact partition being written to. Proceed on that.
+    echo "  WARNING: could not read a disk serial in this chroot;"
+    echo "           relying on the ESP UUID check (${ESP_UUID}) instead"
+fi
 
 echo "  ESP: ${esp_dev}  (disk ${esp_disk}, partition ${esp_part})"
 
