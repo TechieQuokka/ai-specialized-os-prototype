@@ -88,6 +88,24 @@ step() {
 # ---------------------------------------------------------------------------
 trap 'printf "\n\033[31mFailed. Mounts left in place for investigation:\033[0m\n  sudo chroot %s /bin/bash\nLogs: %s\n" "$MNT" "$LOG_DIR"' ERR
 
+# Sync the in-chroot scripts on every run, including when --from skips step 02.
+#
+# --from exists to skip expensive work, not to skip keeping the chroot's copies
+# current. Skipping 02 previously meant `--from 05` re-ran whatever stale copy
+# a failed run had left in /mnt/gentoo/root/ - so a fix made on the host was
+# invisible and the same failure repeated identically.
+sync_chroot_scripts() {
+    mountpoint -q "$MNT" || return 0
+    local staged=()
+    for s in "${SCRIPT_DIR}"/0[3-7]_*.sh; do
+        [ -f "$s" ] || continue
+        install -m 0755 "$s" "${MNT}/root/$(basename "$s")"
+        staged+=("$(basename "$s")")
+    done
+    [ "${#staged[@]}" -gt 0 ] && printf '\n\033[2m-- synced into the chroot: %s\033[0m\n' "${staged[*]}"
+}
+sync_chroot_scripts
+
 step 02 host   02_bootstrap_stage3.sh
 step 05 chroot 05_configure_kernel.sh
 step 06 chroot 06_nvidia_driver.sh
