@@ -17,6 +17,13 @@
 #   firmware boot menu then doubles as the A/B test menu, which lines up with
 #   how the benchmark harness labels its runs.
 #
+#   Those entries live in firmware NVRAM, which this board has erased twice.
+#   So the same command line is also compiled into the image by 05, and the
+#   kernel is installed a second time at \EFI\BOOT\BOOTX64.EFI. NVRAM entries
+#   remain the way to select a configuration; the fallback is what guarantees
+#   the disk still boots, and still appears in the boot menu, when they are
+#   gone. See section 4b.
+#
 # RECOVERY
 #   This writes EFI variables, which is a real and persistent change to the
 #   machine's boot configuration. It adds entries and deliberately leaves the
@@ -211,6 +218,51 @@ cp -f "/boot/config-${KVER}" "${ESP_DIR}/" 2>/dev/null || true
 ls -la "$ESP_DIR"
 
 # ---------------------------------------------------------------------------
+# 4b. The removable-media fallback path, so the disk boots with no NVRAM entry.
+#
+# This used to be documented as a thing NOT to add, and that was correct at the
+# time: the command line lived only in the boot entry's LoadOptions, and this
+# path supplies none, so a kernel booted here came up with no root=, no
+# initramfs to recover, and panicked. The reasoning was sound; its premise has
+# since changed. 05 now compiles the command line in as CONFIG_CMDLINE, so a
+# boot with empty LoadOptions falls back to a complete, working line.
+#
+# That turns the fallback into the answer to the actual failure on this board:
+# the firmware erased the Gentoo NVRAM entries twice on 2026-09-17, the second
+# time within one POST of being written and verified. Most firmwares will offer
+# a disk that has no NVRAM entry only if its ESP carries this exact path, so
+# installing it is also what puts the Toshiba back in the F11 menu when the
+# variables are gone.
+#
+# It boots the plain configuration. The isolcpus variant still needs its own
+# NVRAM entry, because per-configuration command lines are the one thing only
+# LoadOptions can express - but losing that entry now costs an A/B arm, not the
+# ability to boot.
+# ---------------------------------------------------------------------------
+say "Installing the removable-media fallback (\\EFI\\BOOT\\BOOTX64.EFI)"
+
+# Refuse to install a fallback that cannot boot. Without CONFIG_CMDLINE this
+# path panics, and it panics only when NVRAM is already gone - the one moment
+# there is no other way in. A missing /boot/config means 05 was run by some
+# other route; treat not-provable as not-safe.
+if [ -f "/boot/config-${KVER}" ] && grep -q '^CONFIG_CMDLINE_BOOL=y' "/boot/config-${KVER}"; then
+    builtin_cmdline="$(sed -n 's/^CONFIG_CMDLINE="\(.*\)"$/\1/p' "/boot/config-${KVER}")"
+    case "$builtin_cmdline" in
+        *root=PARTUUID=*)
+            mkdir -p /efi/EFI/BOOT
+            install -m 0644 /boot/vmlinuz /efi/EFI/BOOT/BOOTX64.EFI
+            echo "  installed, boots with the builtin command line:"
+            echo "    ${builtin_cmdline}"
+            ;;
+        *)
+            die "the kernel has CONFIG_CMDLINE_BOOL=y but no root=PARTUUID= in CONFIG_CMDLINE; a fallback boot would panic - re-run 05"
+            ;;
+    esac
+else
+    die "the kernel has no builtin CONFIG_CMDLINE; a \\EFI\\BOOT\\BOOTX64.EFI boot would panic with no root= - re-run 05 to compile one in"
+fi
+
+# ---------------------------------------------------------------------------
 # 5. Firmware boot entries.
 # One entry per configuration under test. `nvidia-drm.modeset=0` appears in all
 # of them: the GPU never drives a display here, and the stock baseline measured
@@ -356,6 +408,13 @@ cat <<EOF
 
 To boot it: reboot, open the firmware boot menu (F11 on this board), and pick
 "Gentoo-ML". Ubuntu remains the default, so a failed boot costs a power cycle.
+
+If "Gentoo-ML" is not listed, the firmware has erased the NVRAM entries again.
+The disk should still be offered under its own name (TOSHIBA MQ01ABD100M) via
+\\EFI\\BOOT\\BOOTX64.EFI, which boots the plain configuration from the command
+line compiled into the kernel. Booting that way is not a degraded mode - it is
+the same kernel and the same command line. Only the isolcpus arm needs the
+NVRAM entry, which 12_restore_boot_entries.sh puts back from Ubuntu.
 
 First boot checklist:
   1. Does it reach a login prompt?

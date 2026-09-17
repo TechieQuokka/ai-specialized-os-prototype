@@ -11,7 +11,11 @@
 #   not on the disk, and NVRAM is not ours: clearing CMOS, toggling Fast Boot,
 #   a firmware update, or the board's own housekeeping can all remove them. On
 #   2026-09-17 both entries vanished from an MSI PRO B760M-A after Fast Boot was
-#   disabled, leaving BootOrder with only Windows and Ubuntu in it.
+#   disabled, leaving BootOrder with only Windows and Ubuntu in it - and then
+#   vanished a second time the same evening, within a single POST of this script
+#   writing them and reading them back verified. Whatever the firmware's rule is,
+#   one reboot can be enough to lose them, so nothing that must survive a reboot
+#   may live here alone.
 #
 #   When that happens the target disk disappears from the F11 boot menu
 #   entirely, which reads like a dead drive. It is not: the firmware simply has

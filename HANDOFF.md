@@ -25,10 +25,17 @@ is the only way to answer the question the whole prototype exists for:
    Ubuntu is still the default boot target, so a plain reboot goes back to
    Ubuntu and a failed boot costs only a power cycle.
 
-   **If the Toshiba is not in the F11 menu at all**, its NVRAM boot entries
-   have been dropped by the firmware — see "When the disk vanishes from the
-   boot menu" below. `sudo ./scripts/12_restore_boot_entries.sh` puts them
-   back; the disk itself is almost certainly fine.
+   **If `Gentoo-ML` is not in the F11 menu**, the firmware has discarded the
+   NVRAM entries again — expected on this board, see "When the disk vanishes
+   from the boot menu" below. Look for the Toshiba under a firmware-assigned
+   name instead (`UEFI OS`, or the model string): that is the
+   `\EFI\BOOT\BOOTX64.EFI` fallback, and it boots the plain configuration from
+   the command line compiled into the kernel. It is not a degraded mode — same
+   kernel, same command line. Only the `isolcpus` arm needs the NVRAM entry,
+   which `sudo ./scripts/12_restore_boot_entries.sh` puts back from Ubuntu.
+
+   If the Toshiba is absent under *any* name, run the disk checks in that same
+   section before suspecting hardware. It has been fine every time so far.
 2. Log in as `root`.
 3. ```
    git clone https://github.com/TechieQuokka/ai-specialized-os-prototype
@@ -64,17 +71,33 @@ been written to at any point in this project.
 
 ### When the disk vanishes from the boot menu
 
-Happened on 2026-09-17, after Fast Boot was disabled in the BIOS. `Gentoo-ML`
-and `Gentoo-ML-isolcpus` were both gone from NVRAM — `BootOrder` was back to
-just `0001,0000` — and the Toshiba stopped appearing in the F11 menu entirely.
-It reads like a dead drive. It is not one.
+Happened three times on 2026-09-17, and it is not random: this board discards
+any boot entry it did not itself derive. See the section below for the
+mechanism. The symptom is that `Gentoo-ML` and `Gentoo-ML-isolcpus` are gone
+from NVRAM, `BootOrder` is back to just `0001,0000`, and the Toshiba stops
+appearing in the F11 menu entirely. It reads like a dead drive. It is not one.
 
-EFI boot entries live in firmware NVRAM, not on the disk, and NVRAM is not
-ours: a CMOS clear, a settings change, a firmware update or the board's own
-housekeeping can all remove them. Check before suspecting hardware — from
-Ubuntu, `lsblk` showed `sdc` with all three partitions intact, `dmesg` had no
-SATA errors, and the kernel image was still on the ESP. Nothing was wrong
-except two missing variables.
+**Check the disk from Ubuntu before suspecting hardware.** Every time this has
+happened, the drive has been provably fine, and the checks take a minute:
+
+```
+lsblk -o NAME,SIZE,MODEL,SERIAL,LABEL          # all three partitions present?
+sudo dmesg | grep -E "ata[0-9]+[.:]"           # link up? any resets or errors?
+lsblk -o NAME,PARTTYPE,PARTTYPENAME /dev/sdc   # is sdc1 still an EFI System?
+```
+
+On 2026-09-18 that read: `sdc` with `GENTOO_ESP`/`GENTOO_SWAP`/`GENTOO_ROOT`
+intact, `ata7: SATA link up 3.0 Gbps` with no errors and the drive identifying
+48 ms after link-up, and `sdc1` typed `c12a7328-…` exactly like the Ubuntu ESP.
+Nothing was wrong with the disk on any of the three occasions.
+
+Two details worth knowing so they do not look like faults. **3.0 Gbps is
+correct for this drive** — `MQ01ABD` is a SATA II part; only `MQ01ABF` is
+6 Gb/s. And the Toshiba is always the *last* of the four to be configured, by
+about 40 ms, which is normal 2.5" HDD behaviour and far too small to be a
+spin-up problem. A genuine spin-up-timing fault would also be intermittent;
+this failure is perfectly reproducible, which is what pointed at firmware
+policy rather than hardware.
 
 ```
 sudo ./scripts/12_restore_boot_entries.sh
@@ -86,13 +109,39 @@ Ubuntu stays the default, and then reads NVRAM back to confirm each entry
 exists, points at the right ESP, carries `root=PARTUUID=` and is in
 `BootOrder`.
 
-**A fallback `\EFI\BOOT\BOOTX64.EFI` would not help, so do not add one.** Most
-firmwares will offer a disk with no NVRAM entry only if the ESP carries that
-removable-media path, which makes it a tempting fix. But this is an EFI-stub
-boot: the command line is carried in the boot entry's LoadOptions, and booting
-the fallback path passes none. The kernel would come up with no `root=`, with
-no initramfs to recover and no `CONFIG_CMDLINE` compiled in, and panic.
-Restoring the NVRAM entries is the only thing that actually boots.
+**A fallback `\EFI\BOOT\BOOTX64.EFI` is the actual fix, and it is installed.**
+This file used to say the opposite — "would not help, so do not add one" — and
+that was correct only while the command line lived nowhere but NVRAM. Booting
+the fallback path passes no LoadOptions, so the kernel came up with no `root=`,
+no initramfs to recover, and panicked. The reasoning was sound; the premise has
+since been removed. 05 compiles the command line in as `CONFIG_CMDLINE`, so
+that path now boots.
+
+That matters because restoring NVRAM entries turned out not to be a fix at all,
+only a delay. On 2026-09-18 the 19:24 log from the previous evening was read
+back: `BootOrder` had held **seven** entries and now held two. `0002`, `0003`
+and `0004` had gone along with our `0005` and `0006`. The survivors were
+`\EFI\Microsoft\Boot\bootmgfw.efi` and `\EFI\ubuntu\shimx64.efi`.
+
+Both survivors are paths AMI's own boot scan recognises. This firmware
+regenerates its boot list from that scan every POST and does not carry forward
+entries it cannot re-derive, so `\EFI\Gentoo\vmlinuz-*.efi` was never going to
+survive a reboot no matter how carefully it was written and verified. A disk
+with nothing regenerable on it also never reaches the boot list, which is why
+the Toshiba looked absent from the firmware entirely.
+
+Confirmed by probe before committing to a rebuild: copying the existing kernel
+to `\EFI\BOOT\BOOTX64.EFI` and rebooting made the Toshiba appear immediately,
+and the firmware loaded and ran the kernel, which then panicked at exactly the
+missing `root=` — proving the firmware reads the ESP fine and that the only
+missing piece was the command line.
+
+So the division of labour is now:
+
+- **`\EFI\BOOT\BOOTX64.EFI` + `CONFIG_CMDLINE`** — guarantees the disk is
+  visible and bootable. Survives NVRAM loss because it does not use NVRAM.
+- **NVRAM entries** — select between configurations. Losing them now costs the
+  `isolcpus` arm of the A/B test, not the ability to boot.
 
 ---
 

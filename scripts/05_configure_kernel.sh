@@ -31,6 +31,11 @@ set -euo pipefail
 readonly KDIR="/usr/src/linux"
 readonly JOBS="$(nproc)"
 
+# Compiled into the image as CONFIG_CMDLINE. Must stay identical to
+# BASE_CMDLINE in 07_make_bootable.sh and 12_restore_boot_entries.sh - see the
+# CONFIG_CMDLINE block below for why the kernel carries its own copy.
+readonly BUILTIN_CMDLINE="root=PARTUUID=3eb15fc3-858e-4b37-abe5-d43c8554799a rw nvidia-drm.modeset=0 console=tty0"
+
 die() { printf '\nABORT: %s\n' "$*" >&2; exit 1; }
 say() { printf '\n==> [%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
 
@@ -285,6 +290,33 @@ cfg --enable  EFI_STUB
 cfg --enable  EFIVAR_FS
 cfg --enable  EFI_PARTITION
 
+# ---------------------------------------------------------------------------
+# A command line compiled into the image, so booting does not depend on NVRAM.
+#
+# WHY. The command line normally lives in the EFI boot entry's LoadOptions,
+# which means it lives in firmware NVRAM - and NVRAM is not ours. This board
+# erased the Gentoo boot entries twice on 2026-09-17, the second time within a
+# single POST of being written and verified. With the command line only in
+# NVRAM, losing those variables means losing root=, which means the disk is
+# unbootable until a working Linux is around to run efibootmgr again.
+#
+# Carrying the command line in the image breaks that dependency. It also makes
+# \EFI\BOOT\BOOTX64.EFI a viable boot path (07 installs one): most firmwares
+# will offer a disk with no NVRAM entry only if the ESP carries that
+# removable-media path, and such a boot passes no LoadOptions at all. Without
+# CONFIG_CMDLINE that path panics with no root=; with it, it just boots.
+#
+# OVERRIDE stays off so the per-configuration entries keep working. On x86 with
+# CMDLINE_BOOL=y and CMDLINE_OVERRIDE=n, setup_arch() concatenates the builtin
+# line first and the firmware-supplied line after it, and duplicate parameters
+# are resolved last-wins. So Gentoo-ML-isolcpus still adds isolcpus= on top, and
+# any entry may override root= - while a boot with no LoadOptions at all falls
+# back to exactly the line below.
+# ---------------------------------------------------------------------------
+cfg --enable      CMDLINE_BOOL
+cfg --set-str     CMDLINE "$BUILTIN_CMDLINE"
+cfg --disable     CMDLINE_OVERRIDE
+
 # Debug noise off - these cost real cycles on every relevant path.
 cfg --disable DEBUG_KERNEL
 cfg --disable KASAN
@@ -328,9 +360,37 @@ check() {
 failed=0
 echo "  --- required to boot ---"
 for o in SATA_AHCI BLK_DEV_SD EXT4_FS VFAT_FS DEVTMPFS DEVTMPFS_MOUNT \
-         EFI EFI_STUB EFI_PARTITION PROC_FS SYSFS TMPFS BINFMT_ELF; do
+         EFI EFI_STUB EFI_PARTITION PROC_FS SYSFS TMPFS BINFMT_ELF \
+         CMDLINE_BOOL; do
     check "$o" on || failed=1
 done
+check CMDLINE_OVERRIDE off || failed=1
+
+# The builtin command line is a string, not a tristate, so `check` cannot speak
+# to it - and the failure mode is quiet. An empty or truncated CONFIG_CMDLINE
+# still builds, still boots from an NVRAM entry that supplies its own root=, and
+# only panics on the \EFI\BOOT\BOOTX64.EFI path that exists precisely for when
+# NVRAM is gone. That is the worst time to find out, so assert it here.
+echo "  --- builtin command line (the NVRAM-independent boot path) ---"
+actual_cmdline="$(./scripts/config --state CMDLINE 2>/dev/null || echo '?')"
+if [ "$actual_cmdline" = "$BUILTIN_CMDLINE" ]; then
+    printf '  %-34s OK\n' "CMDLINE"
+    printf '  %-34s %s\n' "" "$actual_cmdline"
+else
+    printf '  %-34s MISMATCH\n' "CMDLINE"
+    printf '    expected: %s\n' "$BUILTIN_CMDLINE"
+    printf '    actual:   %s\n' "$actual_cmdline"
+    failed=1
+fi
+
+# root= is the one parameter with no recoverable default. Checked separately
+# from the string comparison above so a future edit to BUILTIN_CMDLINE that
+# drops it fails here rather than at the next reboot.
+case "$actual_cmdline" in
+    *root=PARTUUID=*) ;;
+    *) echo "  CMDLINE carries no root=PARTUUID= - a fallback boot would panic"
+       failed=1 ;;
+esac
 
 # Without a driver claiming the firmware framebuffer there is no console, and a
 # boot failure becomes unreadable - which defeats the reason for keeping the
