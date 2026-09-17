@@ -329,7 +329,7 @@ class _Block(nn.Module):
 
 class _Model(nn.Module):
     def __init__(self, vocab: int, d_model: int, n_layers: int, n_heads: int,
-                 n_kv_heads: int, d_ff: int) -> None:
+                 n_kv_heads: int, d_ff: int, tie_embeddings: bool = True) -> None:
         super().__init__()
         self.embed = nn.Embedding(vocab, d_model)
         self.blocks = nn.ModuleList(
@@ -338,10 +338,23 @@ class _Model(nn.Module):
         self.norm = nn.RMSNorm(d_model)
         self.head = nn.Linear(d_model, vocab, bias=False)
 
+        # Qwen3-0.6B ties the input embedding and the output head. Leaving them
+        # separate would inflate the parameter count by ~155M on a 0.6B model -
+        # a quarter of it - and with it every memory figure derived from the
+        # count.
+        self.tied = tie_embeddings
+        if tie_embeddings:
+            self.head.weight = self.embed.weight
+
+        self.grad_checkpoint = False
+
     def forward(self, idx: torch.Tensor) -> torch.Tensor:
         x = self.embed(idx)
         for blk in self.blocks:
-            x = blk(x)
+            if self.grad_checkpoint and self.training:
+                x = torch.utils.checkpoint.checkpoint(blk, x, use_reentrant=False)
+            else:
+                x = blk(x)
         return self.head(self.norm(x))
 
 
@@ -350,6 +363,7 @@ def train_step(
     seq_len: int = 1024,
     iters: int = 12,
     dtype: str = "bf16",
+    precision_mode: str = "mixed",
     grad_checkpoint: bool = False,
 ) -> dict[str, Any]:
     """Full fine-tuning step on a Qwen3-0.6B-shaped model, reported as MFU.
@@ -358,28 +372,63 @@ def train_step(
     measure the machine, and a synthetic model of the right shape does that
     without making the benchmark depend on a network fetch or on a tokenizer.
 
+    ``precision_mode`` decides which question is being answered:
+
+    ``pure``
+        Parameters, gradients and optimizer state all live in the low-precision
+        dtype. Roughly ``8 bytes/param``. Fine for measuring throughput, but it
+        understates the memory a real run needs.
+    ``mixed``
+        fp32 master weights with autocast compute - what mixed-precision AdamW
+        full fine-tuning actually does. Roughly ``16 bytes/param``: fp32
+        parameters, fp32 gradients, and two fp32 AdamW moments. This is the
+        configuration the project spec assumes, and the only one that honestly
+        answers whether the workload fits in 12 GB.
+
     MFU (Model FLOPs Utilization) is the number that matters - achieved FLOPs
     over the hardware ceiling. The gap between a GEMM benchmark's TFLOPS and
     this figure is everything the rest of the step costs: optimizer, norms,
-    dataloading, dispatch overhead.
+    dispatch overhead.
     """
+    if precision_mode not in ("pure", "mixed"):
+        raise ValueError(f"precision_mode must be 'pure' or 'mixed', got {precision_mode!r}")
+
     device = torch.device("cuda")
     torch_dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[dtype]
 
-    # Qwen3-0.6B geometry.
+    # Qwen3-0.6B geometry, including its tied embeddings.
     cfg = dict(vocab=151936, d_model=1024, n_layers=28, n_heads=16, n_kv_heads=8, d_ff=3072)
 
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
+
     torch.manual_seed(0)
-    model = _Model(**cfg).to(device)
-    if torch_dtype is not torch.float32:
+    model = _Model(**cfg, tie_embeddings=True).to(device)
+    model.grad_checkpoint = grad_checkpoint
+    model.train()
+
+    use_autocast = precision_mode == "mixed" and torch_dtype is not torch.float32
+    if precision_mode == "pure" and torch_dtype is not torch.float32:
         model = model.to(torch_dtype)
 
-    # 8-bit Adam is not assumed here; plain AdamW keeps the measurement
-    # comparable across systems and is the heavier, more honest case.
+    # fp16 autocast needs loss scaling to keep small gradients from flushing to
+    # zero; bf16 has fp32's exponent range and does not.
+    scaler = (
+        torch.amp.GradScaler("cuda")
+        if use_autocast and torch_dtype is torch.float16
+        else None
+    )
+
+    # 8-bit Adam is not assumed here. Plain AdamW keeps the measurement
+    # comparable across systems and is the heavier, more honest case; the spec
+    # treats 8-bit as the optimisation to reach for once the ceiling is known.
     opt = torch.optim.AdamW(model.parameters(), lr=1e-5, fused=True)
 
+    # With tied embeddings the shared matrix appears once in parameters(), so a
+    # plain sum counts it correctly. Subtracting it once gives the non-embedding
+    # count the FLOPs formula needs.
     n_all = sum(p.numel() for p in model.parameters())
-    n_embed = cfg["vocab"] * cfg["d_model"] + cfg["vocab"] * cfg["d_model"]
+    n_embed = cfg["vocab"] * cfg["d_model"]
     n_non_embed = n_all - n_embed
 
     idx = torch.randint(0, cfg["vocab"], (batch_size, seq_len), device=device)
@@ -387,10 +436,21 @@ def train_step(
 
     def step() -> None:
         opt.zero_grad(set_to_none=True)
-        logits = model(idx)
-        loss = F.cross_entropy(logits.float().view(-1, cfg["vocab"]), tgt.view(-1))
-        loss.backward()
-        opt.step()
+        with torch.autocast("cuda", dtype=torch_dtype, enabled=use_autocast):
+            logits = model(idx)
+            # Deliberately NOT logits.float(): with a 151936-token vocabulary
+            # the logits tensor is the largest allocation in the whole step
+            # (batch x seq x vocab), and materialising an fp32 copy of it
+            # doubles the peak for no numerical benefit - autocast already
+            # runs cross_entropy in fp32 internally.
+            loss = F.cross_entropy(logits.view(-1, cfg["vocab"]), tgt.view(-1))
+        if scaler is not None:
+            scaler.scale(loss).backward()
+            scaler.step(opt)
+            scaler.update()
+        else:
+            loss.backward()
+            opt.step()
 
     try:
         for _ in range(3):
@@ -404,9 +464,22 @@ def train_step(
             torch.cuda.synchronize()
             times.append(time.perf_counter() - t0)
     except torch.cuda.OutOfMemoryError as exc:
+        # Not a harness failure: on a 12 GB card an OOM here is a finding, and
+        # the configuration that produced it is the useful part of the record.
+        peak = torch.cuda.max_memory_allocated() / 1048576
+        del model, opt, idx, tgt
         torch.cuda.empty_cache()
-        return {"error": "out of memory", "detail": str(exc), "batch_size": batch_size,
-                "seq_len": seq_len, "dtype": dtype}
+        torch.cuda.reset_peak_memory_stats()
+        return {
+            "error": "out of memory",
+            "detail": str(exc).splitlines()[0],
+            "batch_size": batch_size,
+            "seq_len": seq_len,
+            "dtype": dtype,
+            "precision_mode": precision_mode,
+            "grad_checkpoint": grad_checkpoint,
+            "peak_vram_mib_before_oom": round(peak),
+        }
 
     secs = statistics.median(times)
     tokens = batch_size * seq_len
@@ -421,18 +494,42 @@ def train_step(
         RTX3060_SPEC["fp32_tflops"] if dtype == "fp32" else RTX3060_SPEC["tensor_dense_tflops"]
     )
 
-    peak_mem = torch.cuda.max_memory_allocated() / 1048576
+    # Split measured peak VRAM into the part that is fixed by the model and the
+    # part that scales with batch and sequence length. Only the second one can
+    # be traded against throughput, so the distinction decides what to tune.
+    #
+    # AdamW allocates its two moments in the dtype of the parameters, so the
+    # per-parameter cost is not the same in the two modes:
+    #   mixed  fp32 params + fp32 grads + two fp32 moments  = 16 bytes
+    #   pure   all four in the low dtype (bf16/fp16)        =  8 bytes
+    if precision_mode == "mixed":
+        bytes_per_param = 4 + 4 + 8
+    else:
+        e = torch_dtype.itemsize
+        bytes_per_param = e + e + 2 * e
+    state_bytes = n_all * bytes_per_param
+    peak_mem_mib = torch.cuda.max_memory_allocated() / 1048576
+    state_mib = state_bytes / 1048576
+
     result = {
         "batch_size": batch_size,
         "seq_len": seq_len,
         "dtype": dtype,
+        "precision_mode": precision_mode,
+        "grad_checkpoint": grad_checkpoint,
         "params_total_m": round(n_all / 1e6, 1),
         "params_non_embedding_m": round(n_non_embed / 1e6, 1),
+        "tied_embeddings": True,
         "seconds_per_step": round(secs, 4),
         "tokens_per_second": round(tokens / secs, 1),
         "achieved_tflops": round(achieved_tflops, 2),
         "mfu_pct": round(100.0 * achieved_tflops / ceiling, 1),
-        "peak_vram_mib": round(peak_mem),
+        "peak_vram_mib": round(peak_mem_mib),
+        "vram_model_state_mib": round(state_mib),
+        "vram_activations_mib": round(max(peak_mem_mib - state_mib, 0)),
+        "vram_headroom_mib": round(
+            torch.cuda.get_device_properties(0).total_memory / 1048576 - peak_mem_mib
+        ),
         "step_time_stdev_s": round(statistics.stdev(times), 5) if len(times) > 1 else 0.0,
     }
 

@@ -85,6 +85,8 @@ def cmd_run(args: argparse.Namespace) -> int:
             batch_size=args.batch_size,
             seq_len=args.seq_len,
             dtype=args.dtype,
+            precision_mode=args.precision_mode,
+            grad_checkpoint=args.grad_checkpoint,
         )
 
     out_dir = Path(args.out)
@@ -140,11 +142,28 @@ def _summarize(r: dict[str, Any]) -> None:
 
     ts = b.get("train_step", {})
     if "mfu_pct" in ts:
+        gc = " +grad-ckpt" if ts.get("grad_checkpoint") else ""
         print(
-            f"\nTraining step      {ts['seconds_per_step']:.3f} s"
+            f"\nTraining step ({ts['dtype']}/{ts['precision_mode']}{gc}, "
+            f"bs={ts['batch_size']} seq={ts['seq_len']})"
+        )
+        print(
+            f"  {ts['seconds_per_step']:.3f} s/step"
             f"   {ts['tokens_per_second']:.0f} tok/s"
+            f"   {ts['achieved_tflops']:.2f} TFLOPS"
             f"   MFU {ts['mfu_pct']}%"
-            f"   peak VRAM {ts['peak_vram_mib']} MiB"
+        )
+        print(
+            f"  VRAM  {ts['peak_vram_mib']} MiB peak"
+            f"  = {ts['vram_model_state_mib']} model state"
+            f" + {ts['vram_activations_mib']} activations"
+            f"   ({ts['vram_headroom_mib']} MiB spare)"
+        )
+    elif ts.get("error") == "out of memory":
+        print(
+            f"\nTraining step      OUT OF MEMORY at {ts['dtype']}/{ts['precision_mode']}"
+            f" bs={ts['batch_size']} seq={ts['seq_len']}"
+            f"  (reached {ts.get('peak_vram_mib_before_oom')} MiB)"
         )
 
     # Any throttling means the ceilings above were the card's limits speaking,
@@ -185,7 +204,8 @@ def _extract(r: dict[str, Any]) -> dict[str, float]:
             flat[f"launch.{k}"] = lo[k]
 
     ts = b.get("train_step", {})
-    for k in ("seconds_per_step", "tokens_per_second", "mfu_pct", "peak_vram_mib"):
+    for k in ("seconds_per_step", "tokens_per_second", "mfu_pct", "peak_vram_mib",
+              "vram_activations_mib"):
         if k in ts:
             flat[f"train.{k}"] = ts[k]
 
@@ -251,6 +271,13 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--batch-size", type=int, default=4)
     r.add_argument("--seq-len", type=int, default=1024)
     r.add_argument("--dtype", default="bf16", choices=["bf16", "fp16", "fp32"])
+    r.add_argument("--precision-mode", default="mixed", choices=["mixed", "pure"],
+                   help="mixed: fp32 master weights + autocast (~16 bytes/param, what the "
+                        "spec assumes). pure: everything in the low dtype (~8 bytes/param, "
+                        "faster but understates real memory use)")
+    r.add_argument("--grad-checkpoint", action="store_true",
+                   help="recompute activations in the backward pass; trades throughput "
+                        "for activation memory")
     r.add_argument("--skip-train", action="store_true",
                    help="skip the training step benchmark")
     r.set_defaults(func=cmd_run)
