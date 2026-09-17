@@ -22,3 +22,6 @@ venv/
 
 # Benchmark results are deliberately NOT ignored: comparing runs across OS
 # configurations is the point of this repository.
+
+# QEMU smoke-test scratch (kernel image copy, overlay files)
+.vmtest/
