@@ -40,7 +40,9 @@ set -euo pipefail
 
 readonly TARGET_SERIAL="Z6CFSL8MS"
 readonly ESP_UUID="930F-3DE2"
-readonly ROOT_UUID="bfeafe2f-51cb-4648-bae4-c81009d78e22"
+# PARTUUID, not the filesystem UUID: with no initramfs the kernel resolves
+# root= itself and can only read identifiers stored in the partition table.
+readonly ROOT_PARTUUID="3eb15fc3-858e-4b37-abe5-d43c8554799a"
 readonly KVER="6.18.48-gentoo"
 
 readonly VM_MEM="4G"
@@ -101,7 +103,7 @@ rmdir "$tmpmnt"
 # console=ttyS0 in addition to tty0: tty0 exercises the FB_SIMPLE console path
 # (the thing being verified), while ttyS0 makes the same output readable as
 # text on the host.
-CMDLINE="root=UUID=${ROOT_UUID} rw nvidia-drm.modeset=0 console=tty0 console=ttyS0,115200"
+CMDLINE="root=PARTUUID=${ROOT_PARTUUID} rw nvidia-drm.modeset=0 console=tty0 console=ttyS0,115200"
 
 say "Booting in QEMU"
 echo "  memory   ${VM_MEM}, cpus ${VM_CPUS}"
@@ -151,11 +153,16 @@ check_log() {
 
 check_log "kernel started"            "Linux version ${KVER}" || true
 check_log "AHCI driver bound"         "ahci.*(AHCI|SSS|slots)" || true
-check_log "disk detected"             "sd [0-9]+:.*\[sda\]|Attached SCSI disk" || true
-check_log "simple-framebuffer claimed" "simple-framebuffer|simplefb" || true
+check_log "partitions detected"       "sda: sda1 sda2 sda3" || true
 check_log "root filesystem mounted"   "EXT4-fs.*mounted filesystem" || true
-check_log "init started"              "Free memory|OpenRC|init:|Starting" || true
+check_log "init started"              "OpenRC|init:|Starting" || true
 check_log "login prompt reached"      "login:" || true
+
+# The FB_SIMPLE console cannot be exercised here. sysfb only registers a
+# simple-framebuffer when the firmware hands one over, and -kernel boot skips
+# the firmware entirely - the guest gets QEMU's emulated VGA instead. That
+# check has to wait for bare metal.
+echo "  [ -- ] simple-framebuffer console (not testable via -kernel boot)"
 
 echo
 if grep -qiE "Kernel panic|Unable to mount root|VFS: Cannot open root" "$SERIAL_LOG"; then

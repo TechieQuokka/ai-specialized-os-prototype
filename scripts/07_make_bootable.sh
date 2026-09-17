@@ -30,7 +30,19 @@
 set -euo pipefail
 
 readonly KVER="6.18.48-gentoo"
-readonly ROOT_UUID="bfeafe2f-51cb-4648-bae4-c81009d78e22"
+
+# root= must use PARTUUID, not the filesystem UUID.
+#
+# Without an initramfs the kernel resolves root= on its own, and it can only
+# read identifiers that live in the partition table. A filesystem UUID lives in
+# the superblock, which cannot be read until the filesystem is mounted - and it
+# cannot be mounted until it has been found. Normally an initramfs breaks that
+# circle by running blkid; this system deliberately has no initramfs.
+#
+# /etc/fstab keeps using the filesystem UUID: that is resolved by mount(8) in
+# userspace, long after the kernel has already mounted the root.
+readonly ROOT_PARTUUID="3eb15fc3-858e-4b37-abe5-d43c8554799a"
+readonly ROOT_FS_UUID="bfeafe2f-51cb-4648-bae4-c81009d78e22"
 readonly ESP_UUID="930F-3DE2"
 readonly TARGET_SERIAL="Z6CFSL8MS"
 readonly ESP_DIR="/efi/EFI/Gentoo"
@@ -169,7 +181,7 @@ echo "  ESP: ${esp_dev}  (disk ${esp_disk}, partition ${esp_part})"
 original_bootorder="$(efibootmgr | awk '/^BootOrder:/{print $2}')"
 echo "  BootOrder before: ${original_bootorder}"
 
-readonly BASE_CMDLINE="root=UUID=${ROOT_UUID} rw nvidia-drm.modeset=0 console=tty0"
+readonly BASE_CMDLINE="root=PARTUUID=${ROOT_PARTUUID} rw nvidia-drm.modeset=0 console=tty0"
 readonly LABEL_PREFIX="Gentoo-ML"
 
 # List the boot numbers of every entry this script owns.
