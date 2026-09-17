@@ -23,6 +23,53 @@ say() { printf '\n==> %s\n' "$*"; }
 ok()  { printf '  [ OK ] %s\n' "$*"; }
 bad() { printf '  [FAIL] %s\n' "$*"; }
 
+# ---------------------------------------------------------------------------
+# Diagnostic handoff.
+#
+# Both disks live in the same machine, so results do not need to travel over
+# the network: they are written here and read back after rebooting into Ubuntu
+# by mounting this filesystem read-only. No GitHub authentication involved.
+#
+# The bundle is written from an EXIT trap so it exists whether this script
+# succeeds or aborts. A run that dies at "nvidia-smi cannot talk to the driver"
+# is precisely the run whose dmesg is worth having, and that is exactly the
+# case where a bundle written only at the end would not exist.
+# ---------------------------------------------------------------------------
+readonly HANDOFF="/root/handoff"
+
+collect_handoff() {
+    local rc=$?
+    mkdir -p "$HANDOFF" 2>/dev/null || return 0
+
+    {
+        echo "exit_status=${rc}"
+        echo "collected=$(date -Is)"
+        echo "kernel=$(uname -r)"
+        echo "cmdline=$(cat /proc/cmdline 2>/dev/null)"
+    } > "${HANDOFF}/summary.txt" 2>/dev/null
+
+    dmesg                        > "${HANDOFF}/dmesg.txt"        2>&1 || true
+    lsmod                        > "${HANDOFF}/lsmod.txt"        2>&1 || true
+    lspci -nnk                   > "${HANDOFF}/lspci.txt"        2>&1 || true
+    ip -details addr             > "${HANDOFF}/ip.txt"           2>&1 || true
+    rc-status --all              > "${HANDOFF}/rc-status.txt"    2>&1 || true
+    nvidia-smi -q                > "${HANDOFF}/nvidia-smi-q.txt" 2>&1 || true
+    nvidia-smi                   > "${HANDOFF}/nvidia-smi.txt"   2>&1 || true
+    cp /proc/cmdline               "${HANDOFF}/cmdline.txt"      2>/dev/null || true
+    cp /var/log/rc.log             "${HANDOFF}/rc.log"           2>/dev/null || true
+
+    # Benchmark output, wherever the repo happens to have been cloned.
+    if [ -d "${PROJECT_DIR}/results" ]; then
+        mkdir -p "${HANDOFF}/results"
+        cp "${PROJECT_DIR}"/results/*.json "${HANDOFF}/results/" 2>/dev/null || true
+    fi
+
+    printf '\n==> Diagnostics written to %s (read from Ubuntu with 11_collect_from_target.sh)\n' \
+        "$HANDOFF"
+    ls -la "$HANDOFF" 2>/dev/null | tail -n +2 | sed 's/^/    /'
+}
+trap collect_handoff EXIT
+
 [ "$(id -u)" -eq 0 ] || die "must run as root"
 [ -f /etc/gentoo-release ] || die "this runs on the Gentoo system, not the Ubuntu host"
 [ -d /mnt/gentoo/usr ] && die "this looks like the chroot, not a booted Gentoo system"

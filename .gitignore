@@ -25,3 +25,6 @@ venv/
 
 # QEMU smoke-test scratch (kernel image copy, overlay files)
 .vmtest/
+
+# Diagnostics copied back off the target after a bare-metal boot
+logs/from-target/
