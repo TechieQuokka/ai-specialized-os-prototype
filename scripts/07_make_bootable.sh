@@ -170,18 +170,36 @@ original_bootorder="$(efibootmgr | awk '/^BootOrder:/{print $2}')"
 echo "  BootOrder before: ${original_bootorder}"
 
 readonly BASE_CMDLINE="root=UUID=${ROOT_UUID} rw nvidia-drm.modeset=0 console=tty0"
+readonly LABEL_PREFIX="Gentoo-ML"
+
+# List the boot numbers of every entry this script owns.
+#
+# efibootmgr prints "BootXXXX* <label>\t<device path>", so the label is not at
+# end of line - an anchored "label$" match never fires, which is how earlier
+# runs ended up creating duplicates instead of replacing. Splitting on the tab
+# isolates the header field and the label within it.
+our_bootnums() {
+    efibootmgr | sed 's/\x1b\[[0-9;]*m//g' | awk -F'\t' -v p="$LABEL_PREFIX" '
+        match($1, /^Boot[0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f]\*? /) {
+            num = substr($1, 5, 4)
+            lbl = substr($1, RLENGTH + 1)
+            if (index(lbl, p) == 1) print num
+        }'
+}
+
+# Clear out every entry this script owns before creating any, so a re-run
+# replaces rather than accumulates.
+stale="$(our_bootnums)"
+if [ -n "$stale" ]; then
+    echo "  removing previously created entries: $(echo "$stale" | paste -sd, -)"
+    for num in $stale; do
+        efibootmgr --delete-bootnum --bootnum "$num" >/dev/null
+    done
+fi
 
 make_entry() {
     local label="$1" extra="$2" cmdline
     cmdline="${BASE_CMDLINE}${extra:+ $extra}"
-
-    # Remove a previous entry with the same label so re-runs do not pile up.
-    efibootmgr | sed 's/\x1b\[[0-9;]*m//g' \
-        | awk -v l="$label" '$0 ~ "^Boot[0-9A-Fa-f]{4}\\*? " l "$" {print substr($1,5,4)}' \
-        | while read -r num; do
-            [ -n "$num" ] && efibootmgr --delete-bootnum --bootnum "$num" >/dev/null
-        done
-
     efibootmgr --create \
         --disk "$esp_disk" --part "$esp_part" \
         --label "$label" \
@@ -207,21 +225,35 @@ make_entry "Gentoo-ML-isolcpus" "isolcpus=2,3 nohz_full=2,3 rcu_nocbs=2,3"
 #
 # Appending keeps the previous default intact and still guarantees the entries
 # are visible.
-if [ -n "$original_bootorder" ]; then
-    gentoo_nums="$(
-        efibootmgr | sed 's/\x1b\[[0-9;]*m//g' \
-            | awk '/^Boot[0-9A-Fa-f]{4}\*? Gentoo-ML/ {print substr($1,5,4)}' \
+new_nums="$(our_bootnums)"
+gentoo_nums="$(printf '%s' "$new_nums" | paste -sd, -)"
+
+if [ -n "$original_bootorder" ] && [ -n "$gentoo_nums" ]; then
+    # Everything this script has ever owned: the numbers deleted a moment ago
+    # and the ones just created. Both have to come out of the captured
+    # BootOrder - the stale ones because they no longer exist, the new ones
+    # because they are about to be appended.
+    exclude="$(printf '%s\n%s\n' "$stale" "$new_nums" | awk 'NF && !seen[$0]++')"
+
+    others="$(
+        printf '%s' "$original_bootorder" | tr ',' '\n' \
+            | awk 'NF' \
+            | grep -vxF "$exclude" \
+            | awk '!seen[$0]++' \
             | paste -sd, -
     )"
-    if [ -n "$gentoo_nums" ]; then
-        efibootmgr --bootorder "${original_bootorder},${gentoo_nums}" >/dev/null
-        say "BootOrder set to ${original_bootorder},${gentoo_nums}"
-        echo "  the previous default (${original_bootorder%%,*}) still boots first"
-    else
-        efibootmgr --bootorder "$original_bootorder" >/dev/null
-        say "WARNING: could not identify the new entries; BootOrder left unchanged"
-    fi
+
+    new_order="${others:+${others},}${gentoo_nums}"
+    efibootmgr --bootorder "$new_order" >/dev/null
+    say "BootOrder set to ${new_order}"
+    [ -n "$others" ] && echo "  the previous default (${others%%,*}) still boots first"
+else
+    say "WARNING: could not rebuild BootOrder; leaving it as the firmware set it"
 fi
+
+# emerge leaves a ._cfg0000_ copy behind when it wants to replace a config file
+# this script owns. Drop it so etc-update does not keep prompting about it.
+rm -f /etc/modprobe.d/._cfg[0-9]*_nvidia.conf
 
 # ---------------------------------------------------------------------------
 # 6. Report
