@@ -1,0 +1,24 @@
+# Installation payloads. The stage3 tarball is ~255 MB, well past GitHub's
+# per-file limit, and it is reproducible from the URL recorded in the scripts.
+downloads/
+
+# Build logs are large, machine-specific and regenerated on every run.
+logs/
+
+# Local GPG keyring used to verify the stage3 signature.
+.gnupg/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# Editors
+*.swp
+.idea/
+.vscode/
+
+# Benchmark results are deliberately NOT ignored: comparing runs across OS
+# configurations is the point of this repository.
