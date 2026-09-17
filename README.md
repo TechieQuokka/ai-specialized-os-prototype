@@ -144,10 +144,16 @@ cable comes out and nothing else on the machine has changed.
 - [x] Portage configured — `no-multilib` profile, `-march=native`, graphical stack excluded
 - [x] Ebuild repository synced, locale / timezone / fstab written
 - [x] GPU benchmark harness written (`gpubench/`)
-- [ ] `@world` rebuild and base toolset
-- [ ] Minimal kernel configuration
-- [ ] NVIDIA driver integration
-- [ ] Baseline comparison across OS configurations
+- [x] `stock-ubuntu` baseline captured (`results/`)
+- [x] `@world` rebuild and base toolset — 21 min, graphical stack absent from the tree
+- [x] Minimal kernel — 1,457 options against Ubuntu's 10,048, 8.8 MB image
+- [x] NVIDIA 595.84 built against it; all five modules present
+- [x] Bootable — EFI stub, no bootloader, no initramfs; QEMU smoke test passes
+- [ ] **First bare-metal boot** — does CUDA survive the stripped kernel?
+- [ ] `minimal-gentoo` measurement and the comparison
+
+See [`HANDOFF.md`](HANDOFF.md) for the current state, the exact next steps, and
+the reasoning behind the decisions that are settled.
 
 ### Already visible on the stock system
 
