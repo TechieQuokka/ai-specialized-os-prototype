@@ -1,5 +1,9 @@
 # Installed with the system Python + pip, per the project's "no conda/venv"
 # rule. torch ships its own CUDA runtime, so the only thing the OS has to
 # provide is the kernel driver.
-torch>=2.14.0
-nvidia-ml-py>=13.580.0
+#
+# 2.5 is the real floor: scaled_dot_product_attention gained `enable_gqa`
+# there, which the Qwen3-shaped attention block in benches.py relies on.
+# Verified working against 2.11.0+cu130.
+torch>=2.5
+nvidia-ml-py>=12.0
