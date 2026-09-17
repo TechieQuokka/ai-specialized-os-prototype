@@ -93,13 +93,23 @@ fi
 # ---------------------------------------------------------------------------
 say "Enabling boot services"
 
+# Registers a service and then checks that the runlevel symlink exists.
+#
+# The previous version discarded rc-update's output and exit status and printed
+# "-> default" unconditionally, so a failed registration was indistinguishable
+# from a successful one until the service failed to appear at boot. Reporting
+# what was attempted is not the same as reporting what happened.
 add_service() {
     local svc="$1" runlevel="${2:-default}"
-    if rc-service --exists "$svc" 2>/dev/null; then
-        rc-update add "$svc" "$runlevel" >/dev/null 2>&1 || true
-        printf '  %-22s -> %s\n' "$svc" "$runlevel"
+    if ! rc-service --exists "$svc" 2>/dev/null; then
+        printf '  %-22s MISSING (no init script)\n' "$svc"
+        return 0
+    fi
+    rc-update add "$svc" "$runlevel" >/dev/null 2>&1 || true
+    if [ -L "/etc/runlevels/${runlevel}/${svc}" ]; then
+        printf '  %-22s -> %s  (verified)\n' "$svc" "$runlevel"
     else
-        printf '  %-22s MISSING (skipped)\n' "$svc"
+        die "${svc} was not registered in runlevel ${runlevel}"
     fi
 }
 
@@ -157,11 +167,25 @@ term_type="vt100"
 # never asserts.
 agetty_options="--local-line"
 AGETTY
-    rc-update add agetty.ttyS0 default >/dev/null 2>&1 || true
-    echo "  agetty.ttyS0 -> default runlevel"
+
+    # Output deliberately NOT suppressed. The previous version sent rc-update's
+    # output and exit status to /dev/null and then printed its own success
+    # message unconditionally - so a failed registration still reported
+    # "-> default runlevel", and the only symptom was a getty that never
+    # appeared. Printing a claim is not the same as verifying it.
+    rc-update add agetty.ttyS0 default
+
+    # Verify the registration rather than trusting the command's exit status.
+    if [ -L /etc/runlevels/default/agetty.ttyS0 ]; then
+        echo "  verified: /etc/runlevels/default/agetty.ttyS0"
+    else
+        die "rc-update reported success but /etc/runlevels/default/agetty.ttyS0 does not exist"
+    fi
 else
     echo "  WARNING: /etc/init.d/agetty missing; no serial getty configured"
 fi
+echo "  runlevel default now contains:"
+ls -1 /etc/runlevels/default/ | sed 's/^/    /'
 grep -E '^#?(c1|s0):' /etc/inittab | sed 's/^/    /'
 
 say "Configuring sshd"

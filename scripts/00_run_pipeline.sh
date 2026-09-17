@@ -184,8 +184,10 @@ assert "boot: root= uses PARTUUID, not filesystem UUID" \
        "${LOG_DIR}/07_make_bootable.log" 'root=PARTUUID='
 refute "boot: no stale root=UUID= entry written" \
        "${LOG_DIR}/07_make_bootable.log" 'root=UUID='
-assert "boot: serial getty enabled" \
-       "${LOG_DIR}/07_make_bootable.log" 'agetty\.ttyS0 -> default runlevel'
+# Asserts the verification line, not the attempt: 07 used to print its own
+# success message regardless of what rc-update actually did.
+assert "boot: serial getty registered (verified)" \
+       "${LOG_DIR}/07_make_bootable.log" 'verified: /etc/runlevels/default/agetty\.ttyS0'
 assert "boot: EFI entries not duplicated" \
        "${LOG_DIR}/07_make_bootable.log" 'BootOrder set to'
 
