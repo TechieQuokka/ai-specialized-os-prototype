@@ -143,11 +143,28 @@ cable comes out and nothing else on the machine has changed.
 - [x] stage3 verified (GPG + SHA-512) and unpacked
 - [x] Portage configured — `no-multilib` profile, `-march=native`, graphical stack excluded
 - [x] Ebuild repository synced, locale / timezone / fstab written
+- [x] GPU benchmark harness written (`gpubench/`)
 - [ ] `@world` rebuild and base toolset
 - [ ] Minimal kernel configuration
 - [ ] NVIDIA driver integration
-- [ ] GPU benchmark harness
 - [ ] Baseline comparison across OS configurations
+
+### Already visible on the stock system
+
+Environment capture on the unmodified Ubuntu host surfaced four things worth
+fixing before any of them get blamed on something else:
+
+| Finding | Why it costs throughput |
+|---|---|
+| `scaling_governor = powersave` | the 4 cores feeding the GPU are not free to boost |
+| `persistence_mode = Disabled` | the driver unloads between processes; clocks drop with it |
+| `transparent_hugepage = madvise` | project spec calls for THP off with explicit hugepages |
+| 358 MiB VRAM held by the desktop session | gone once the target boots headless |
+
+Also worth noting: the card reports a maximum SM clock of 2130 MHz against the
+1777 MHz rated boost the 12.74 TFLOPS reference figure is derived from. The
+harness records both, so achieved throughput can be compared against the clock
+the card actually ran at rather than only against the spec sheet.
 
 ---
 

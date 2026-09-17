@@ -1,0 +1,5 @@
+# Installed with the system Python + pip, per the project's "no conda/venv"
+# rule. torch ships its own CUDA runtime, so the only thing the OS has to
+# provide is the kernel driver.
+torch>=2.14.0
+nvidia-ml-py>=13.580.0
