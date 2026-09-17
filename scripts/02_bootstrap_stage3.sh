@@ -236,11 +236,19 @@ if [ -L /dev/shm ]; then
 fi
 
 # --- stage the in-chroot scripts --------------------------------------------
-for s in 03_chroot_setup.sh 04_build_world.sh; do
-    if [ -f "${SCRIPT_DIR}/${s}" ]; then
-        say "Staging ${s} into ${MNT}/root/"
-        install -m 0755 "${SCRIPT_DIR}/${s}" "${MNT}/root/${s}"
-    fi
+# Every script that runs inside the chroot, not just the next one. Staging a
+# subset means a later re-run silently executes a stale copy from a previous
+# session - which is exactly how an already-fixed root=UUID command line got
+# written into the EFI boot entries a second time.
+say "Staging in-chroot scripts into ${MNT}/root/"
+for s in "${SCRIPT_DIR}"/0[3-9]_*.sh; do
+    [ -f "$s" ] || continue
+    case "$(basename "$s")" in
+        08_teardown_chroot.sh) continue ;;   # runs on the host
+        09_gentoo_first_boot.sh) continue ;; # runs on the booted system
+    esac
+    install -m 0755 "$s" "${MNT}/root/$(basename "$s")"
+    printf '    %s\n' "$(basename "$s")"
 done
 
 # --- report -----------------------------------------------------------------
