@@ -1,4 +1,4 @@
-# Handoff — state as of 2026-09-17
+# Handoff — state as of 2026-09-18
 
 Written for a fresh session picking this up cold. `README.md` explains what the
 project is and why; this file says where it stands and what to do next.
@@ -8,14 +8,33 @@ project is and why; this file says where it stands and what to do next.
 ## Where things stand
 
 A minimal Gentoo system is **installed and bootable** on the Toshiba HDD. The
-kernel and NVIDIA driver are built, the EFI boot entries are written, and a
-QEMU smoke test confirms the boot path works end to end.
+kernel and NVIDIA driver are built, the EFI boot entries are written, and the
+QEMU smoke test now reaches a login prompt and accepts a login — the one item
+it had previously left unproven.
+
+The full pipeline was last run clean on 2026-09-18 at 09:02–09:05:
+
+```
+05  kernel built, 1,459 options, CONFIG_CMDLINE recorded at /boot/config-6.18.48-gentoo
+06  nvidia.ko nvidia-uvm.ko nvidia-drm.ko nvidia-modeset.ko nvidia-peermem.ko
+07  \EFI\BOOT\BOOTX64.EFI installed with the builtin command line
+    Gentoo-ML and Gentoo-ML-isolcpus written, BootOrder 0001,0000,0002,0003,0004
+10  boots to a login prompt on serial
+```
 
 **Nothing has been booted on bare metal yet.** That is the next action, and it
 is the only way to answer the question the whole prototype exists for:
 
 > Does the CUDA stack survive a kernel stripped from Ubuntu's 10,048 enabled
-> options down to 1,457?
+> options down to 1,459?
+
+One trap worth naming, because it has already caused a false alarm: step 10
+boots the installation **in QEMU**, with `snapshot=on` so the real disk is never
+written. Its serial console prints the same `gentoo-ml login:` banner the real
+machine does. Logging in there proves the getty works and nothing else — any
+work done inside it is discarded when the VM exits. If a `gentoo-ml login:` is
+on screen, check whether `00_run_pipeline.sh` is still running before concluding
+the machine has booted.
 
 ---
 
@@ -183,6 +202,14 @@ sdc2  8 GiB    swap   GENTOO_SWAP    build insurance; swapoff for benchmarks
 sdc3  922 GiB  ext4   GENTOO_ROOT
 ```
 
+The ESP carries the same kernel twice, on purpose:
+
+```
+\EFI\Gentoo\vmlinuz-6.18.48-gentoo.efi   named NVRAM entries point here
+\EFI\Gentoo\config-6.18.48-gentoo        the config that image was built from
+\EFI\BOOT\BOOTX64.EFI                    the firmware's own scan finds this one
+```
+
 `root=` must use **PARTUUID** and `/etc/fstab` must use the **filesystem
 UUID**. They are not interchangeable — see "Decisions" below.
 
@@ -240,15 +267,20 @@ command line lives in the EFI boot entry, so each configuration under test gets
 its own named entry and the firmware boot menu doubles as the A/B test menu:
 
 ```
-Boot0002  Gentoo-ML            root=PARTUUID=... rw nvidia-drm.modeset=0 console=tty0
-Boot0003  Gentoo-ML-isolcpus   + isolcpus=2,3 nohz_full=2,3 rcu_nocbs=2,3
-BootOrder 0001,0000,0002,0003                     <- 0001 is Ubuntu, still first
+Boot0002  UEFI OS              \EFI\BOOT\BOOTX64.EFI  <- firmware made this one
+Boot0003  Gentoo-ML            root=PARTUUID=... rw nvidia-drm.modeset=0 console=tty0
+Boot0004  Gentoo-ML-isolcpus   + isolcpus=2,3 nohz_full=2,3 rcu_nocbs=2,3
+BootOrder 0001,0000,0002,0003,0004                <- 0001 is Ubuntu, still first
 ```
 
+`UEFI OS` is not ours. The firmware created it by finding
+`\EFI\BOOT\BOOTX64.EFI` during its own scan, which is exactly why it is the
+entry that survives — it is regenerated rather than remembered. It boots the
+plain configuration from the kernel's builtin command line.
+
 **Refer to these by label, never by number.** The firmware assigns the number,
-and it reuses freed slots: these were `Boot0005`/`Boot0006` until the NVRAM loss
-described above, and came back as `0002`/`0003` when they were recreated. The
-label is ours and is stable.
+and it reuses freed slots: `Gentoo-ML` has been `Boot0005`, then `Boot0002`,
+and is now `Boot0003`. The label is ours and is stable.
 
 **Both `FB_SIMPLE` and `FB_EFI`.** sysfb registers `simple-framebuffer` when the
 firmware's mode is compatible with the generic modes and falls back to
@@ -371,13 +403,13 @@ no initramfs, OpenRC, udev, dhcpcd, sshd, and absence of panics.
 
 ## How the bugs went, and what changed
 
-Eleven bugs during this build. Two were real system-configuration problems
+Thirteen bugs during this build. Two were real system-configuration problems
 (`root=UUID=` without an initramfs, and the missing `efi-framebuffer` fallback
-driver). The other nine were all script orchestration: source-versus-deployed
+driver). The other eleven were all script orchestration: source-versus-deployed
 copies drifting, mount preconditions, and success being announced rather than
 verified.
 
-Three patterns worth not repeating:
+Four patterns worth not repeating:
 
 - **Writing a parser against an assumed output format.** `efibootmgr` prints the
   device path after the label, so an anchored `label$` match never fired and
@@ -392,6 +424,25 @@ Three patterns worth not repeating:
   implies `root=PARTUUID=`; "headless" implies the console still needs a
   framebuffer driver. When a constraint is chosen, write it down and check what
   else it touches.
+
+- **Code exercised only on the clean path.** Both of 2026-09-18's bugs were
+  this, and both blocked *resuming* rather than starting. 07 read
+  `/boot/config-$KVER` for evidence that the kernel had a builtin command line,
+  on the assumption that `make install` leaves one there — it does that only
+  when an `installkernel` is in `$PATH`, and none is, so the file had never
+  existed. 02 fed lsblk's `MOUNTPOINT` column to `umount`, which works until a
+  rerun finds swap active and the column reads `[SWAP]`; a clean run never sees
+  it because 08 swaps off during teardown. `--from` exists to make resuming
+  cheap, so the resume path deserves the same scrutiny as the first run.
+
+Two smaller notes from the same day. The `/boot/config` copy to the ESP had
+carried `2>/dev/null || true` since it was written, so the file's absence had
+been tolerated silently the whole time — the suppress-and-continue pattern
+above, caught only because a later guard happened to need the same file. And
+07's error for that guard named the wrong cause, telling the next run to re-run
+05 when 05's own log showed `CMDLINE_BOOL y OK` and the full command line
+verified; an error that misidentifies its cause costs a diagnosis cycle and
+nearly sent the fix in the wrong direction.
 
 `00_run_pipeline.sh` ends with one assertion per bug that actually occurred, so
 a regression surfaces at the end of a run rather than at the next reboot.

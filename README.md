@@ -102,11 +102,28 @@ the init layer, not bootstrapping a toolchain.
 
 ```
 scripts/
+  00_run_pipeline.sh            runs 02, 05, 06, 07, 08, 10 in order, with a verdict
   01_partition_target_disk.sh   partition + format the target disk
   02_bootstrap_stage3.sh        mount, unpack stage3, write Portage config, chroot prep
   03_chroot_setup.sh            repo sync, profile, timezone, locale, fstab   (in chroot)
   04_build_world.sh             Portage update, @world rebuild, base toolset  (in chroot)
+  05_configure_kernel.sh        kernel config, verify, build, install         (in chroot)
+  06_nvidia_driver.sh           NVIDIA 595.84 against that kernel             (in chroot)
+  07_make_bootable.sh           services, ESP, EFI boot entries + fallback    (in chroot)
+  08_teardown_chroot.sh         clean recursive unmount
+  09_gentoo_first_boot.sh       verify, install torch, benchmark    (on booted Gentoo)
+  10_vm_smoke_test.sh           QEMU boot test, non-destructive (snapshot=on)
+  11_collect_from_target.sh     read /root/handoff off the target disk
+  12_restore_boot_entries.sh    recreate the EFI boot entries after NVRAM loss
+
+gpubench/                       the measurement harness
+results/                        labelled benchmark runs, diffed across configurations
 ```
+
+`00_run_pipeline.sh --from <step>` resumes after a failure, and stops at the
+first failing step with the mounts left in place so the chroot can be inspected.
+Step 02 always runs regardless, because it establishes those mounts and syncs
+the in-chroot scripts.
 
 Not in version control: `downloads/` (the stage3 tarball, reproducible from the
 URL in the scripts) and `logs/`.
@@ -146,11 +163,40 @@ cable comes out and nothing else on the machine has changed.
 - [x] GPU benchmark harness written (`gpubench/`)
 - [x] `stock-ubuntu` baseline captured (`results/`)
 - [x] `@world` rebuild and base toolset — 21 min, graphical stack absent from the tree
-- [x] Minimal kernel — 1,457 options against Ubuntu's 10,048, 8.8 MB image
+- [x] Minimal kernel — 1,459 options against Ubuntu's 10,048, 8.8 MB image
 - [x] NVIDIA 595.84 built against it; all five modules present
-- [x] Bootable — EFI stub, no bootloader, no initramfs; QEMU smoke test passes
+- [x] Bootable — EFI stub, no bootloader, no initramfs; QEMU smoke test reaches a login prompt
+- [x] Boot path survives NVRAM loss — see below; the firmware erased the entries three times
 - [ ] **First bare-metal boot** — does CUDA survive the stripped kernel?
 - [ ] `minimal-gentoo` measurement and the comparison
+
+### The firmware does not keep boot entries it did not create
+
+Worth stating in the README because it looks like failing hardware and is not.
+On 2026-09-17 the Gentoo EFI boot entries vanished three times, once within a
+single POST of being written and verified, and the target disk stopped appearing
+in the boot menu altogether.
+
+The board is an MSI PRO B760M-A DDR4 II (AMI firmware). It rebuilds its boot
+list from its own scan every POST and does not carry forward entries it cannot
+re-derive. A `BootOrder` that had held seven entries held two the next morning —
+the survivors being `\EFI\Microsoft\Boot\bootmgfw.efi` and
+`\EFI\ubuntu\shimx64.efi`, both paths that scan recognises. A disk with nothing
+regenerable on it never reaches the boot list at all, which is what made a
+perfectly healthy drive look dead.
+
+So the boot path no longer depends on NVRAM:
+
+- The kernel carries its own command line as `CONFIG_CMDLINE`, so a boot that
+  supplies no LoadOptions still finds `root=`.
+- The kernel is installed a second time at `\EFI\BOOT\BOOTX64.EFI`, the
+  removable-media path the firmware's scan does recognise and regenerates on its
+  own. It appears as `UEFI OS`.
+
+Named NVRAM entries are still written, because a per-configuration command line
+is the one thing only LoadOptions can express, and the firmware boot menu
+doubling as the A/B test menu is worth keeping. But losing them now costs the
+`isolcpus` arm of a comparison rather than the ability to boot at all.
 
 See [`HANDOFF.md`](HANDOFF.md) for the current state, the exact next steps, and
 the reasoning behind the decisions that are settled.
