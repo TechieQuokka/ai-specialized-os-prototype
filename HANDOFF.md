@@ -133,8 +133,17 @@ What that boot actually shows is that **udev coldplug loaded no modules at
 all**: `nvidia` appears at 15.2 s, which is the `modules` service at the `boot`
 runlevel loading it by name, not `udev-trigger` at `sysinit` matching its
 modalias. `nvidia_drm`, the other module nothing names explicitly, is missing
-too. Why coldplug did nothing is **still unknown** and needs a live boot to
-diagnose — see the preflight below.
+too. Why coldplug did nothing is **still unknown**.
+
+**It is intermittent, which is the most useful thing known about it.** The
+11:22 boot came up with `r8169` loaded and `enp3s0` holding a lease, on the
+same disk and the same kernel, with nothing changed in between. So it is not a
+missing file or a wrong config — every candidate of that shape was checked and
+cleared anyway — but a race or a timing-dependent failure in coldplug. That
+also means catching it requires being lucky on the boot where it happens:
+`13_gentoo_preflight_and_run.sh` captures `udevadm test` output automatically,
+but only on a boot that actually fails, which is why the evidence is still
+outstanding.
 
 `06_nvidia_driver.sh` now names `r8169` in `/etc/conf.d/modules` so the one
 network interface no longer depends on coldplug working. That file is written
@@ -147,6 +156,27 @@ was `a8d1d0e`, and `--feed-path` arrived in `39a2de7`. Even with working
 network, that run would have re-measured the existing baseline and produced
 nothing new. **`git pull` is a required step, not a tidiness step** — it was
 missing from this runbook, which is why it was missed.
+
+### And why the 11:22 retry still did not measure
+
+Adding the `git pull` was not enough, because the pull itself refused:
+
+```
+error: The following untracked working tree files would be overwritten by merge:
+        results/20260918T100008-minimal-gentoo.json
+        ... Aborting
+```
+
+Results are written on the target and travel back to Ubuntu over the disk,
+where they are committed and pushed. So the same file ends up untracked here
+and tracked upstream, and git will not overwrite an untracked file with a
+merge. `13` now moves exactly those files — untracked locally, present in
+`origin/main` — into `/root/handoff/preserved/` before merging, rather than
+deleting them.
+
+The `--feed-path` guard did its job: the stale checkout was caught and the run
+stopped instead of quietly re-measuring the old baseline and looking like a
+success.
 
 This is the measurement that answers what the CPU↔GPU path costs, and it is
 the one place the two kernels still might differ in a way that matters.

@@ -235,8 +235,10 @@ cable comes out and nothing else on the machine has changed.
       `nvidia_drm`, the two modules nothing names explicitly, were both absent,
       while the two named in `/etc/conf.d/modules` loaded fine. Every disk-side
       explanation was checked and cleared (alias, deps, firmware, blacklists,
-      rules, `USE=kmod`), so the answer needs a live boot. `r8169` is now named
-      explicitly, which removes the dependency on the answer without being one
+      rules, `USE=kmod`). **The next boot was fine on the same disk and kernel**,
+      so it is a race rather than a misconfiguration, and catching it means
+      being on the boot where it happens. `r8169` is now named explicitly,
+      which removes the dependency on the answer without being one
 - [ ] Raise the training step off **34.9%** of the bf16 ceiling — the weakest
       path by a wide margin, and now known not to be OS noise
 - [ ] `isolcpus` arm — `headless` and `performance-governor` after it

@@ -81,15 +81,22 @@ else
     dmesg | tail -20 | sed 's/^/  /'
 fi
 
-say "Bringing up DHCP"
-rc-service dhcpcd restart 2>&1 | sed 's/^/  /'
-
-# dhcpcd needs a moment; poll rather than guess.
+# Only restart dhcpcd if it is actually needed. Restarting it unmounts and
+# remounts network filesystems, which is a pointless risk on a boot where the
+# interface already came up with a lease.
 route_ok=0
-for _ in $(seq 1 30); do
-    if ip route get 1.1.1.1 >/dev/null 2>&1; then route_ok=1; break; fi
-    sleep 1
-done
+if ip route get 1.1.1.1 >/dev/null 2>&1; then
+    ok "default route already present - leaving dhcpcd alone"
+    route_ok=1
+else
+    say "Bringing up DHCP"
+    rc-service dhcpcd restart 2>&1 | sed 's/^/  /'
+    # dhcpcd needs a moment; poll rather than guess.
+    for _ in $(seq 1 30); do
+        if ip route get 1.1.1.1 >/dev/null 2>&1; then route_ok=1; break; fi
+        sleep 1
+    done
+fi
 ip -brief addr 2>&1 | sed 's/^/  /'
 if [ "$route_ok" -eq 1 ]; then
     ok "default route present"
@@ -122,7 +129,28 @@ say "Updating the checkout at ${PROJECT_DIR}"
 cd "$PROJECT_DIR" || die "cannot cd to ${PROJECT_DIR}"
 
 echo "  before: $(git rev-parse --short HEAD)"
-git pull --ff-only 2>&1 | sed 's/^/  /'
+git fetch --quiet origin main 2>&1 | sed 's/^/  /'
+
+# Results are written here by 09 and travel back to Ubuntu over the disk, where
+# they get committed and pushed. So the same file can exist here untracked and
+# upstream tracked, and git refuses to overwrite an untracked file with a merge
+# - which is exactly how the 11:22 session aborted. Move those aside instead of
+# deleting them: the assumption that the upstream copy is the same file is very
+# probably right, and this is cheap insurance for the run where it is not.
+mkdir -p "${HANDOFF}/preserved"
+preserved=0
+while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    if git cat-file -e "origin/main:${f}" 2>/dev/null; then
+        mkdir -p "${HANDOFF}/preserved/$(dirname "$f")"
+        mv "$f" "${HANDOFF}/preserved/${f}"
+        echo "  preserved untracked file that upstream also has: ${f}"
+        preserved=$((preserved+1))
+    fi
+done < <(git ls-files --others --exclude-standard)
+[ "$preserved" -gt 0 ] && echo "  ${preserved} moved to ${HANDOFF}/preserved/"
+
+git merge --ff-only origin/main 2>&1 | sed 's/^/  /'
 echo "  after:  $(git rev-parse --short HEAD)"
 
 # Verify the pull actually delivered the thing being measured, rather than
