@@ -155,6 +155,16 @@ def _torch() -> dict[str, Any]:
         "cudnn": torch.backends.cudnn.version(),
         "cuda_available": torch.cuda.is_available(),
     }
+
+    # Recorded because the feed-path benchmark runs a torchvision model
+    # through a torchvision transform pipeline, so its version is part of
+    # what has to match between two runs being compared.
+    try:
+        import torchvision
+
+        info["torchvision"] = torchvision.__version__
+    except ImportError:
+        info["torchvision"] = None
     if torch.cuda.is_available():
         props = torch.cuda.get_device_properties(0)
         info.update(

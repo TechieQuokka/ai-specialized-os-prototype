@@ -29,6 +29,12 @@ RTX3060_SPEC = {
 # achievable ceiling nearer 25 GB/s.
 PCIE4_X16_PRACTICAL_GBS = 25.0
 
+# Where the feed-path benchmark keeps its JPEG corpus. It has to be a tmpfs:
+# Ubuntu runs from a Samsung SSD and the Gentoo target from a 5400rpm Toshiba
+# HDD, so a corpus on the real filesystem would compare those two disks
+# instead of the two kernels. /dev/shm is tmpfs on both systems.
+FEED_PATH_DATA_ROOT = "/dev/shm/gpubench-images"
+
 
 def compute_ceiling(dtype: str) -> float:
     """The TFLOPS ceiling a given GEMM dtype is scored against.

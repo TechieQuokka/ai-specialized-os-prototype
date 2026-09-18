@@ -32,6 +32,12 @@ readonly PROJECT_DIR="${SCRIPT_DIR%/scripts}"
 # Moving this pin invalidates every existing baseline. Re-take both sides.
 readonly TORCH_VERSION="${TORCH_VERSION:-2.14.0}"
 
+# torchvision supplies the ResNet-50 and the transform pipeline the feed-path
+# benchmark runs, so its version is part of what has to match between the two
+# sides. It ships a wheel built against one exact torch release; 0.29.0 is the
+# one that pairs with torch 2.14.0.
+readonly TORCHVISION_VERSION="${TORCHVISION_VERSION:-0.29.0}"
+
 die() { printf '\nABORT: %s\n' "$*" >&2; exit 1; }
 say() { printf '\n==> %s\n' "$*"; }
 ok()  { printf '  [ OK ] %s\n' "$*"; }
@@ -182,28 +188,58 @@ PIP_FLAGS=()
 python3 -c 'import sys,sysconfig,os; sys.exit(0 if os.path.exists(os.path.join(sysconfig.get_path("stdlib"),"EXTERNALLY-MANAGED")) else 1)' \
     && PIP_FLAGS+=(--break-system-packages) || true
 
-# The wheel tag carries a local version ("2.14.0+cu130"), so compare only the
-# public part against the pin.
-installed_torch="$(python3 -c 'import torch; print(torch.__version__)' 2>/dev/null || true)"
+# Install one pinned package and prove afterwards that the pin is what landed.
+# The wheel tag carries a local version ("2.14.0+cu130"), so only the public
+# part is compared. Verifying rather than assuming matters because pip will
+# happily resolve to a different release when the pinned one has no wheel for
+# this Python, and a silent substitution here is exactly the confound the pin
+# exists to prevent.
+install_pinned() {
+    local module="$1" want="$2"; shift 2
+    local have
+    have="$(python3 -c "import ${module}; print(${module}.__version__)" 2>/dev/null || true)"
 
-if [ -z "$installed_torch" ]; then
-    say "Installing torch ${TORCH_VERSION} (large download - the CUDA runtime ships inside the wheel)"
-    python3 -m pip install "${PIP_FLAGS[@]}" "torch==${TORCH_VERSION}" nvidia-ml-py \
-        || die "torch install failed"
-elif [ "${installed_torch%%+*}" != "$TORCH_VERSION" ]; then
-    say "Replacing torch ${installed_torch} with the pinned ${TORCH_VERSION}"
-    echo "  the installed version is not the one this comparison was calibrated on"
-    python3 -m pip install "${PIP_FLAGS[@]}" "torch==${TORCH_VERSION}" nvidia-ml-py \
-        || die "torch install failed"
-else
-    ok "torch ${installed_torch} already installed (matches the pin)"
+    if [ -z "$have" ]; then
+        say "Installing ${module} ${want}"
+        python3 -m pip install "${PIP_FLAGS[@]}" "${module}==${want}" "$@" \
+            || die "${module} install failed"
+    elif [ "${have%%+*}" != "$want" ]; then
+        say "Replacing ${module} ${have} with the pinned ${want}"
+        echo "  the installed version is not the one this comparison was calibrated on"
+        python3 -m pip install "${PIP_FLAGS[@]}" "${module}==${want}" "$@" \
+            || die "${module} install failed"
+    else
+        ok "${module} ${have} already installed (matches the pin)"
+        return 0
+    fi
+
+    have="$(python3 -c "import ${module}; print(${module}.__version__)" 2>/dev/null || true)"
+    [ "${have%%+*}" = "$want" ] \
+        || die "${module} is ${have:-absent}, expected ${want} - results would not be comparable"
+}
+
+# torch first: the torchvision wheel resolves against whatever torch is present,
+# and installing it the other way round can drag torch to a different release.
+install_pinned torch "$TORCH_VERSION" nvidia-ml-py
+install_pinned torchvision "$TORCHVISION_VERSION"
+
+# Re-check torch: resolving torchvision can pull torch along with it, and a
+# pin that held at install time but not afterwards is worth nothing.
+after="$(python3 -c 'import torch; print(torch.__version__)' 2>/dev/null || true)"
+[ "${after%%+*}" = "$TORCH_VERSION" ] \
+    || die "installing torchvision moved torch to ${after:-absent}, expected ${TORCH_VERSION}"
+
+# pynvml drives the telemetry sampler. It rides along with nvidia-ml-py above,
+# but only on a run that actually installed torch - so check it separately.
+# Without it the sampler degrades silently and every result reports "No
+# throttling observed", which is indistinguishable from a card that was never
+# throttled. A missing measurement must not read as a clean one.
+if ! python3 -c 'import pynvml' 2>/dev/null; then
+    say "Installing nvidia-ml-py (telemetry would be silently absent without it)"
+    python3 -m pip install "${PIP_FLAGS[@]}" nvidia-ml-py || die "nvidia-ml-py install failed"
 fi
-
-# Verify rather than assume: pip can resolve to something else entirely when
-# the pinned version has no wheel for this Python.
-final_torch="$(python3 -c 'import torch; print(torch.__version__)' 2>/dev/null || true)"
-[ "${final_torch%%+*}" = "$TORCH_VERSION" ] \
-    || die "torch is ${final_torch:-absent}, expected ${TORCH_VERSION} - results would not be comparable"
+python3 -c 'import pynvml' 2>/dev/null \
+    || die "pynvml still unimportable - throttle data would be missing and would look like none"
 
 python3 - <<'EOF'
 import torch
@@ -222,8 +258,17 @@ python3 -c 'import torch,sys; sys.exit(0 if torch.cuda.is_available() else 1)' \
 # ---------------------------------------------------------------------------
 say "Running the benchmark (label: ${LABEL})"
 cd "$PROJECT_DIR"
+
+# --feed-path builds its JPEG corpus under /dev/shm, so the measurement stays
+# off the 5400rpm target disk. Ubuntu runs from an SSD and this machine from
+# an HDD; a corpus on the real filesystem would compare the two disks instead
+# of the two kernels, which is the one confound this whole comparison cannot
+# absorb.
+df -h /dev/shm | tail -1 | sed 's/^/  tmpfs for the image corpus: /'
+
 python3 -m gpubench run --label "$LABEL" \
-    --precision-mode mixed --batch-size 1 --seq-len 1024
+    --precision-mode mixed --batch-size 1 --seq-len 1024 \
+    --feed-path --feed-batch-size 64 --feed-steps 40
 
 say "Comparing against the stock baseline"
 stock="$(ls -1 results/*stock-ubuntu*.json 2>/dev/null | tail -1)"
@@ -239,8 +284,12 @@ cat <<'EOF'
 Next, to measure the core-isolation configuration separately: reboot, pick
 "Gentoo-ML-isolcpus" from the firmware boot menu, and run
 
-    python3 -m gpubench run --label gentoo-isolcpus --precision-mode mixed \
-        --batch-size 1 --seq-len 1024
+    ./scripts/09_gentoo_first_boot.sh isolcpus
+
+Check that the isolation actually took before trusting the numbers - it is
+recorded in every result file, and has been empty on every run so far:
+
+    python3 -m gpubench env | grep -E 'isolated|nohz_full'
 
 Then compare all three.
 EOF

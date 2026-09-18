@@ -111,24 +111,56 @@ the machine has booted.
 
 ## Do this next
 
-**Boot the `isolcpus` arm.** Both baselines are now settled with repeats, and
-the open question is the one in "Where things stand": the training step sits at
-**34.9%** of the bf16 ceiling and is the weakest path by a wide margin. Nothing
-measured so far is OS noise — compute, memory and throughput are identical
-between the two kernels — so the remaining loss is structural: four cores
-feeding 3584, which is exactly what `isolcpus` is meant to protect.
+**Boot Gentoo and take the feed-path measurement.** It is new, so no Gentoo
+run has it yet; the Ubuntu side already does. `09_gentoo_first_boot.sh` now
+passes `--feed-path`, so simply re-running it collects everything.
 
-The +9% eager-launch regression points the same way. Dispatch is the one place
-the minimal kernel loses, and dispatch is what core isolation defends.
+This is the measurement that answers what the CPU↔GPU path costs, and it is
+the one place the two kernels still might differ in a way that matters.
+Everything measured so far on the device side came out identical — compute,
+memory, training throughput — while the two real differences (PCIe transfer
++38/+73%, dispatch −9%) both live on the boundary between host and device.
+The feed path is that boundary under load, so it is where those two effects
+either cancel or compound.
+
+On Ubuntu the answer is **94.7% of the card's ceiling survives being fed**
+(transfer −2.5%, host −2.8%, n=3, spanning 94.7–94.8%). The GPU sits blocked on
+the loader 2.4% of wall time, and the worker sweep peaks at 2 and degrades past
+the physical core count:
+
+```
+workers   0: 230.3    2: 386.9    4: 382.7    8: 356.5   img/s   (mean of 3)
+```
+
+That baseline is reproducible to ±0.05 percentage points, which makes it a
+sensitive instrument: a real difference on the Gentoo side will be unmissable.
+Whether the minimal kernel does better is unmeasured.
+
+```
+# reboot, F11, pick Gentoo-ML
+for i in 1 2 3; do ./scripts/09_gentoo_first_boot.sh; done
+# back on Ubuntu
+sudo ./scripts/11_collect_from_target.sh
+cp logs/from-target/results/*.json results/
+python3 -m gpubench compare results/*stock-ubuntu*.json results/*minimal-gentoo*.json
+```
+
+The first run on Gentoo will install `torchvision` and build the JPEG corpus
+under `/dev/shm`; both are cached afterwards. The corpus must stay on tmpfs —
+Ubuntu runs from an SSD and the target from a 5400rpm HDD, and that is the one
+confound this comparison cannot absorb.
+
+**Then boot the `isolcpus` arm.** The training step sits at **34.9%** of the
+bf16 ceiling and is the weakest path by a wide margin. Nothing measured so far
+is OS noise, so the remaining loss is structural: four cores feeding 3584,
+which is exactly what `isolcpus` is meant to protect. The −9% eager-launch
+regression points the same way — dispatch is the one place the minimal kernel
+loses, and dispatch is what core isolation defends.
 
 ```
 # reboot, F11, pick Gentoo-ML-isolcpus  (needs the NVRAM entry; if it is gone,
 # sudo ./scripts/12_restore_boot_entries.sh from Ubuntu first)
 for i in 1 2 3; do ./scripts/09_gentoo_first_boot.sh isolcpus; done
-# back on Ubuntu
-sudo ./scripts/11_collect_from_target.sh
-cp logs/from-target/results/*.json results/
-python3 -m gpubench compare results/*minimal-gentoo*.json results/*isolcpus*.json
 ```
 
 The script takes the label as its first argument, so each arm keeps its own
@@ -158,8 +190,16 @@ not in the delta table: a configuration 0.7% faster than Ubuntu is still
 leaving two thirds of the card unused if its MFU is 34%.
 
 **Environment for the Ubuntu side**: `~/miniconda3/envs/gpubench-314`
-(Python 3.14.7 + torch 2.14.0), built to match Gentoo exactly. The older
-`envs/torch` is Python 3.11 / torch 2.11 and must not be used for baselines.
+(Python 3.14.7 + torch 2.14.0 + torchvision 0.29.0), built to match Gentoo
+exactly. The older `envs/torch` is Python 3.11 / torch 2.11 and must not be
+used for baselines. Run from the project root with `PYTHONPATH=$PWD`, since
+`gpubench` is not installed into the environment:
+
+```
+PYTHONPATH=$PWD ~/miniconda3/envs/gpubench-314/bin/python -m gpubench run \
+    --label stock-ubuntu --precision-mode mixed --batch-size 1 --seq-len 1024 \
+    --feed-path --feed-batch-size 64 --feed-steps 40
+```
 
 ---
 

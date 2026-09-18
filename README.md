@@ -33,6 +33,29 @@ There are six places the throughput goes:
 Item 6 is the one this project is actually about. Items 1–5 have to be pinned
 down first, or there is no way to attribute anything to item 6.
 
+Items 2 and 3 only show their real cost under a workload that actually feeds
+the card, which is what the `feed_path` benchmark is for. It runs ResNet-50
+three times — on a batch already resident in VRAM, then with the batch
+transferred each step, then with real JPEG decode and augmentation in
+DataLoader workers — so the loss splits cleanly into transfer, host, and
+what survives:
+
+```
+    408.5 img/s   batch already in VRAM      <- the card's own ceiling
+                  + PCIe transfer, pinned       −2.5%
+    386.9 img/s   + real decode / augment       −2.8%
+                  = 94.7% of the ceiling survives being fed
+```
+
+(stock-ubuntu, mean of three runs; the efficiency figure spans 94.7–94.8%.)
+
+Image classification is the vehicle, not the point: JPEG decode and augment
+put measurable load on the host in a way token slicing does not, and the
+four-core CPU is this build's structural weak point. The corpus is generated
+rather than downloaded, and lives on tmpfs — Ubuntu runs from an SSD and the
+Gentoo target from a 5400rpm HDD, so reading it from the real filesystem
+would compare the two disks instead of the two kernels.
+
 That is why the deliverable is a **re-runnable harness** rather than a
 one-shot benchmark. Every run is tagged with a configuration label, and results
 are diffed across labels:
@@ -118,6 +141,8 @@ scripts/
 
 gpubench/                       the measurement harness
   spec.py                       the hardware ceilings, importable without torch
+  benches.py                    the five device-side measurements
+  pipeline.py                   the CPU->GPU feed path (needs torchvision)
 results/                        labelled benchmark runs, diffed across configurations
 ```
 
@@ -126,6 +151,7 @@ The harness answers the fraction-of-peak question directly:
 ```
 python3 -m gpubench utilization results/*.json    # achieved vs ceiling, per path
 python3 -m gpubench compare  a.json b.json        # what a config change was worth
+python3 -m gpubench run --label X --feed-path     # include the CPU->GPU feed path
 ```
 
 `utilization` needs only the result file, not a CUDA stack, so a run collected
@@ -193,10 +219,15 @@ cable comes out and nothing else on the machine has changed.
 - [x] **OS noise measurably removed** — Gentoo holds pinned PCIe inside a
       0.01 GB/s window and memory bandwidth identical across four runs, where
       Ubuntu swings 13% run to run on the same hardware. Item 6 below, caught
+- [x] **CPU→GPU feed path measured** (`gpubench/pipeline.py`) — on stock-ubuntu
+      **94.7%** of the card's ceiling survives a real decode/augment/transfer
+      pipeline (transfer −2.5%, host −2.8%), reproducible to ±0.05 pp over 3 runs
+- [ ] Take the feed path on Gentoo — no Gentoo run has it yet; the two known
+      kernel differences (PCIe +38/+73%, dispatch −9%) both live on that
+      boundary, so this is where they cancel or compound
 - [ ] Raise the training step off **34.9%** of the bf16 ceiling — the weakest
       path by a wide margin, and now known not to be OS noise
-- [ ] `isolcpus` arm — the next one to boot; `headless` and
-      `performance-governor` after it
+- [ ] `isolcpus` arm — `headless` and `performance-governor` after it
 
 ### The firmware does not keep boot entries it did not create
 

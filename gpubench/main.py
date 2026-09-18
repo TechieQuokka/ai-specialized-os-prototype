@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from . import env
+from . import env, spec
 from .telemetry import Telemetry
 
 # `benches` is imported lazily inside cmd_run: it pulls in torch, and the `env`
@@ -87,6 +87,20 @@ def cmd_run(args: argparse.Namespace) -> int:
             dtype=args.dtype,
             precision_mode=args.precision_mode,
             grad_checkpoint=args.grad_checkpoint,
+        )
+
+    # Off by default: it needs torchvision, builds a JPEG corpus on first use,
+    # and takes several minutes because it sweeps worker counts.
+    if args.feed_path:
+        from . import pipeline
+
+        b["feed_path"] = _run_one(
+            "feed_path",
+            pipeline.feed_path,
+            batch_size=args.feed_batch_size,
+            steps=args.feed_steps,
+            resolution=args.feed_resolution,
+            data_root=args.feed_data_root,
         )
 
     out_dir = Path(args.out)
@@ -166,6 +180,49 @@ def _summarize(r: dict[str, Any]) -> None:
             f"  (reached {ts.get('peak_vram_mib_before_oom')} MiB)"
         )
 
+    fp = b.get("feed_path", {})
+    if "feed_efficiency_pct" in fp:
+        print(
+            f"\nCPU->GPU feed path (ResNet-50, bs={fp['batch_size']}, "
+            f"{fp['resolution']}px, {fp['host_cpus']} host CPUs)"
+        )
+        print(
+            f"  {fp['device_only']['images_per_s']:8.1f} img/s  batch already in VRAM"
+            f"   <- the card's own ceiling"
+        )
+        print(
+            f"  {fp['h2d_pinned']['images_per_s']:8.1f} img/s  + PCIe transfer, pinned"
+            f"   ({fp['h2d_pinned']['h2d_ms_per_step']:.2f} ms/step,"
+            f" {fp['h2d_pinned']['h2d_gbs']:.1f} GB/s)"
+        )
+        print(
+            f"  {fp['h2d_pageable']['images_per_s']:8.1f} img/s  + PCIe transfer, pageable"
+        )
+        full = fp["full"]
+        print(
+            f"  {full['images_per_s']:8.1f} img/s  + real decode/augment"
+            f"   (num_workers={fp['best_workers']})"
+        )
+        print(
+            f"\n  Feed efficiency  {fp['feed_efficiency_pct']:.1f}% of the ceiling survives"
+            f"   (transfer −{fp['transfer_cost_pct']:.1f}%, host −{fp['host_cost_pct']:.1f}%)"
+        )
+        print(
+            f"  GPU starved      {full['loader_wait_fraction']:.1%} of wall time"
+            f" blocked on the loader"
+        )
+        print(
+            f"  Step jitter      p50 {full['step_ms_p50']:.2f} ms"
+            f"   p99 {full['step_ms_p99']:.2f} ms"
+            f"   ({full['step_ms_jitter_p99_over_p50']:.2f}x)"
+        )
+        sweep = fp.get("full_by_workers", {})
+        if len(sweep) > 1:
+            line = "  workers          " + "   ".join(
+                f"{nw}:{e['images_per_s']:.0f}" for nw, e in sorted(sweep.items(), key=lambda kv: int(kv[0]))
+            )
+            print(line + "  img/s")
+
     # Any throttling means the ceilings above were the card's limits speaking,
     # not the code's.
     throttled = []
@@ -234,6 +291,15 @@ def _utilization(r: dict[str, Any]) -> list[dict[str, Any]]:
         add(f"training {ts.get('dtype', '?')} step", ts.get("achieved_tflops"), "TFLOPS",
             compute_ceiling(ts.get("dtype", "bf16")), ts.get("mfu_pct"),
             note="model FLOPs utilisation")
+
+    # The feed path is scored against the card's own measured ceiling rather
+    # than a vendor figure: the question is what survives being fed, not what
+    # the spec sheet promises.
+    fp = b.get("feed_path", {})
+    if "feed_efficiency_pct" in fp:
+        add("feed     real data", fp["full"]["images_per_s"], "img/s",
+            fp["device_only"]["images_per_s"], fp["feed_efficiency_pct"],
+            note=f"vs batch-resident ceiling, {fp['best_workers']} workers")
 
     return rows
 
@@ -306,6 +372,18 @@ def _extract(r: dict[str, Any]) -> dict[str, float]:
         if k in ts:
             flat[f"train.{k}"] = ts[k]
 
+    fp = b.get("feed_path", {})
+    if "feed_efficiency_pct" in fp:
+        flat["feed.ceiling_img_s"] = fp["device_only"]["images_per_s"]
+        flat["feed.real_img_s"] = fp["full"]["images_per_s"]
+        flat["feed.efficiency_pct"] = fp["feed_efficiency_pct"]
+        flat["feed.transfer_cost_pct"] = fp["transfer_cost_pct"]
+        flat["feed.host_cost_pct"] = fp["host_cost_pct"]
+        flat["feed.h2d_ms_per_step"] = fp["h2d_pinned"]["h2d_ms_per_step"]
+        flat["feed.loader_wait_fraction"] = fp["full"]["loader_wait_fraction"]
+        flat["feed.step_ms_p50"] = fp["full"]["step_ms_p50"]
+        flat["feed.step_ms_p99"] = fp["full"]["step_ms_p99"]
+
     return flat
 
 
@@ -329,8 +407,13 @@ def cmd_compare(args: argparse.Namespace) -> int:
             a, bv = base.get(key), flat.get(key)
             if a is None or bv is None:
                 continue
-            # Lower is better for latency and memory footprint.
-            lower_better = "us_per_launch" in key or "seconds_per_step" in key or "vram" in key
+            # Lower is better for latency, memory footprint, and for the feed
+            # path's cost/wait/jitter figures - those measure what is lost.
+            lower_better = any(
+                s in key
+                for s in ("us_per_launch", "seconds_per_step", "vram",
+                          "_cost_pct", "wait_fraction", "step_ms", "h2d_ms")
+            )
             delta = (bv - a) / a * 100 if a else 0.0
             arrow = ""
             if abs(delta) >= 1.0:
@@ -365,6 +448,7 @@ def cmd_compare(args: argparse.Namespace) -> int:
 # just as easily have been the torch upgrade. Nothing in the output said so.
 _STACK_FIELDS = (
     ("torch", ("torch", "torch"), "torch"),
+    ("torchvision", ("torch", "torchvision"), "torchvision"),
     ("cuda runtime", ("torch", "cuda_runtime"), "CUDA runtime"),
     ("cudnn", ("torch", "cudnn"), "cuDNN"),
     ("python", ("python",), "Python"),
@@ -443,6 +527,15 @@ def main(argv: list[str] | None = None) -> int:
                         "for activation memory")
     r.add_argument("--skip-train", action="store_true",
                    help="skip the training step benchmark")
+    r.add_argument("--feed-path", action="store_true",
+                   help="also measure the CPU->GPU feed path (needs torchvision; "
+                        "sweeps DataLoader worker counts, takes several minutes)")
+    r.add_argument("--feed-batch-size", type=int, default=64)
+    r.add_argument("--feed-steps", type=int, default=40)
+    r.add_argument("--feed-resolution", type=int, default=224)
+    r.add_argument("--feed-data-root", default=spec.FEED_PATH_DATA_ROOT,
+                   help="where the JPEG corpus lives; must be a tmpfs, or this "
+                        "measures the disk instead of the kernel")
     r.set_defaults(func=cmd_run)
 
     c = sub.add_parser("compare", help="diff two or more result files")
