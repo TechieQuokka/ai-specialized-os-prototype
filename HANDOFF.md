@@ -53,32 +53,44 @@ to the card's limits (92–106%); pageable H2D sits at 59.6%.
 
 ### What the OS was actually worth
 
-Measured the same day on a matched stack — torch 2.14.0, Python 3.14.7,
-cuDNN 92400 on **both** sides — with Ubuntu repeated three times to establish
-a noise band. `results/` holds all four runs.
+Measured 2026-09-18 on a matched stack — torch 2.14.0, Python 3.14.7,
+cuDNN 92400 on **both** sides, so the kernel is the only variable. Ubuntu ran
+three times (09:46–09:48), Gentoo four across two separate boots (09:25 and
+10:00–10:01). `results/` holds all seven. A row counts as a difference only
+when the two min..max ranges do not overlap.
 
-| path | ubuntu n=3 (min..max) | gentoo n=1 | verdict |
+| path | ubuntu n=3 | gentoo n=4 | verdict |
 |---|---|---|---|
-| GEMM fp32 | 9.33 .. 9.54 TFLOPS | 9.40 | same |
-| GEMM bf16 | 27.03 .. 27.49 TFLOPS | 26.97 | same (−0.2%) |
-| memory bandwidth | 331.9 .. 333.1 GB/s | 333.1 | same |
-| train MFU | 34.80 .. 35.00 % | 34.80 | same |
-| train tok/s | 3872 .. 3893 | 3870 | same (−0.06%) |
-| **PCIe pageable H2D** | 8.10 .. 8.89 GB/s | **14.90** | **+68%, outside the band** |
-| PCIe pinned H2D | 15.56 .. 20.30 GB/s | 24.58 | +21%, but see below |
-| **kernel launch (eager)** | 2.79 .. 2.85 µs | **3.05** | **+7% slower** |
+| GEMM fp32 | 9.33 .. 9.54 TFLOPS | 9.40 .. 9.54 | overlap — same |
+| GEMM bf16 | 27.03 .. 27.49 TFLOPS | 26.97 .. 27.28 | overlap — same |
+| memory bandwidth | 331.9 .. 333.1 GB/s | 333.1 .. 333.1 | overlap — same |
+| train MFU | 34.80 .. 35.00 % | 34.80 .. 35.00 | overlap — same |
+| train tok/s | 3872 .. 3893 | 3870 .. 3896 | overlap — same |
+| **PCIe pageable H2D** | 8.10 .. 8.89 GB/s | **14.81 .. 14.90** | **+73%** |
+| **PCIe pinned H2D** | 15.56 .. 20.30 GB/s | **24.58 .. 24.59** | **+38%** |
+| **kernel launch (eager)** | 2.79 .. 2.85 µs | **3.04 .. 3.14** | **+9% slower** |
+| kernel launch (graphed) | 0.89 .. 0.90 µs | 0.91 .. 0.92 | +2% slower |
 
 So the minimal kernel costs nothing on compute, memory or training throughput,
-wins large on pageable host-to-device transfer, and loses a little on kernel
-dispatch. CUDA graph capture cuts the dispatch cost to 0.92 µs (3.3x), so the
-launch regression is a structural weak point rather than a real ceiling.
+wins large on host-to-device transfer, and loses a little on kernel dispatch.
+Graph capture cuts dispatch to 0.91 µs (3.3x), so the launch regression is a
+structural weak point rather than a real ceiling.
 
-**Two of these are not yet confirmed, because Gentoo has only one sample.**
-Ubuntu's pinned-PCIe figure swings ±13% run to run (15.56 .. 20.30), so the
-+21% cannot be trusted until Gentoo is repeated. The pageable +68% is far
-enough outside a tight band (±5%) to survive almost any plausible Gentoo
-variance. Run `09_gentoo_first_boot.sh` three times on the next boot to settle
-both; the torch pin now keeps the stack fixed automatically.
+**The variance is the more interesting result.** The minimal kernel is not
+just faster on transfer, it is close to deterministic:
+
+```
+PCIe pinned     ubuntu 15.56 .. 20.30  (±13%)     gentoo 24.58 .. 24.59  (±0.02%)
+PCIe pageable   ubuntu  8.10 ..  8.89  (±4.6%)    gentoo 14.81 .. 14.90  (±0.3%)
+memory          ubuntu 331.9 .. 333.1             gentoo 333.1 .. 333.1  (identical x4)
+```
+
+Four Gentoo runs across two boots put memory bandwidth at the same figure to
+one decimal, and pinned PCIe inside a 0.01 GB/s window, while Ubuntu's pinned
+figure moves 13% run to run on the same hardware. This is item 6 in the
+README's table — OS-level noise — and it is the thing the project set out to
+remove. For a measurement harness it matters more than the means: a 13% swing
+is wide enough to hide most of the effects the later arms are meant to detect.
 
 An earlier comparison, made before the pin existed, reported GEMM regressions
 of −1.3% to −2.8% and a +59% pageable gain. The regressions were the torch
@@ -99,26 +111,38 @@ the machine has booted.
 
 ## Do this next
 
-**Boot Gentoo and take three runs, not one.** Everything on the Gentoo side is
-a single sample, which is why two findings in the table above are still marked
-unconfirmed. Ubuntu already has its three (`results/`, 2026-09-18 09:46–09:48).
+**Boot the `isolcpus` arm.** Both baselines are now settled with repeats, and
+the open question is the one in "Where things stand": the training step sits at
+**34.9%** of the bf16 ceiling and is the weakest path by a wide margin. Nothing
+measured so far is OS noise — compute, memory and throughput are identical
+between the two kernels — so the remaining loss is structural: four cores
+feeding 3584, which is exactly what `isolcpus` is meant to protect.
+
+The +9% eager-launch regression points the same way. Dispatch is the one place
+the minimal kernel loses, and dispatch is what core isolation defends.
 
 ```
-# on Gentoo, after booting
-for i in 1 2 3; do ./scripts/09_gentoo_first_boot.sh; done
+# reboot, F11, pick Gentoo-ML-isolcpus  (needs the NVRAM entry; if it is gone,
+# sudo ./scripts/12_restore_boot_entries.sh from Ubuntu first)
+for i in 1 2 3; do ./scripts/09_gentoo_first_boot.sh isolcpus; done
 # back on Ubuntu
 sudo ./scripts/11_collect_from_target.sh
 cp logs/from-target/results/*.json results/
-python3 -m gpubench compare results/*stock-ubuntu*.json results/*minimal-gentoo*.json
+python3 -m gpubench compare results/*minimal-gentoo*.json results/*isolcpus*.json
 ```
 
-The script pins torch itself now, so the stack stays fixed without thinking
-about it. It also replaces a mismatched torch if it finds one.
+The script takes the label as its first argument, so each arm keeps its own
+results instead of landing on top of the baseline just established. Confirm
+the isolation actually took before trusting the numbers — `env.capture()`
+records `cpu.isolated` and `cpu.nohz_full`, and they were empty on every run
+so far:
 
-Then the open question is the one in "Where things stand": raising the 34.8%
-training MFU. The `isolcpus` arm exists to test exactly that and has never been
-booted — and the +7% kernel-launch regression is a reason to expect it might
-help, since dispatch is exactly what core isolation protects.
+```
+python3 -m gpubench env | grep -E 'isolated|nohz_full'
+```
+
+Take three runs per arm. The Gentoo side is deterministic enough that three is
+plenty; it is Ubuntu that needs them.
 
 ### Reading the comparison
 

@@ -185,15 +185,18 @@ cable comes out and nothing else on the machine has changed.
 - [x] **First bare-metal boot** — 2026-09-18; **CUDA survives the stripped kernel**
       (`nvidia-smi` works, all four modules loaded, `exit_status=0`)
 - [x] `minimal-gentoo` measurement captured (`results/`)
-- [x] **Valid comparison on a matched stack** — torch 2.14.0 / Python 3.14.7 /
-      cuDNN 92400 on both sides, Ubuntu repeated 3x for a noise band.
-      Compute, memory and training throughput are **unchanged** by the stripped
-      kernel; pageable H2D transfer is **+68%**; kernel launch is **+7% slower**
-- [ ] Repeat the Gentoo side 3x — it has one sample, so the pinned-PCIe (+21%)
-      and launch (+7%) findings are not yet confirmed
-- [ ] Raise the training step off **34.8%** of the bf16 ceiling — the weakest
-      path, and the reason the `isolcpus` arm exists
-- [ ] `headless`, `isolcpus`, `performance-governor` arms — none booted yet
+- [x] **Valid comparison on a matched stack, with repeats** — torch 2.14.0 /
+      Python 3.14.7 / cuDNN 92400 on both sides; Ubuntu n=3, Gentoo n=4 across
+      two boots. Compute, memory and training throughput are **unchanged** by
+      the stripped kernel; H2D transfer is **+73% pageable / +38% pinned**;
+      kernel launch is **+9% slower** (2% once graphed)
+- [x] **OS noise measurably removed** — Gentoo holds pinned PCIe inside a
+      0.01 GB/s window and memory bandwidth identical across four runs, where
+      Ubuntu swings 13% run to run on the same hardware. Item 6 below, caught
+- [ ] Raise the training step off **34.9%** of the bf16 ceiling — the weakest
+      path by a wide margin, and now known not to be OS noise
+- [ ] `isolcpus` arm — the next one to boot; `headless` and
+      `performance-governor` after it
 
 ### The firmware does not keep boot entries it did not create
 

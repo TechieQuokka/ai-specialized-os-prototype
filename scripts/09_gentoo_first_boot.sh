@@ -14,7 +14,10 @@
 #
 set -euo pipefail
 
-readonly LABEL="minimal-gentoo"
+# The configuration being measured. Each boot arm needs its own label or its
+# results land on top of an established baseline:
+#     ./09_gentoo_first_boot.sh isolcpus
+readonly LABEL="${1:-${LABEL:-minimal-gentoo}}"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly PROJECT_DIR="${SCRIPT_DIR%/scripts}"
 
