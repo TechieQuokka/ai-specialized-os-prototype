@@ -88,12 +88,27 @@ actual="$(sha512sum "$STAGE3" | awk '{print $1}')"
 say "SHA512 matches the GPG-verified DIGESTS entry"
 
 # --- release udisks automounts on the target -------------------------------
+# Only filesystem mounts are in the way. lsblk reports an active swap partition
+# with the literal string "[SWAP]" in the MOUNTPOINT column rather than a path,
+# and feeding that to umount fails with "no mount point specified" - which
+# aborts the whole pipeline. This script enables that same swap a few lines
+# below, so there is nothing to release and nothing to gain by turning it off.
+#
+# It stayed hidden because a clean run never reaches this state: 08 swaps off
+# during teardown, so the disk is quiet by the time 02 runs again. It takes a
+# rerun after a mid-pipeline failure, with swap still on, to hit it - which is
+# exactly when the pipeline most needs to be able to resume.
 say "Releasing any automounts on ${target}"
-while read -r mnt; do
-    [ -n "$mnt" ] && [ "$mnt" != "$MNT" ] || continue
+while read -r dev mnt; do
+    [ -n "$mnt" ] || continue
+    if [ "$mnt" = "[SWAP]" ]; then
+        echo "    ${dev} is active swap - left alone, re-checked below"
+        continue
+    fi
+    [ "$mnt" != "$MNT" ] || continue
     echo "    umount ${mnt}"
     umount "$mnt" || die "could not unmount ${mnt}"
-done < <(lsblk -nro MOUNTPOINT "$target" | grep -v '^$' || true)
+done < <(lsblk -nrpo NAME,MOUNTPOINT "$target" || true)
 
 # --- mount ------------------------------------------------------------------
 say "Mounting target filesystems under ${MNT}"
