@@ -37,17 +37,22 @@ Items 2 and 3 only show their real cost under a workload that actually feeds
 the card, which is what the `feed_path` benchmark is for. It runs ResNet-50
 three times — on a batch already resident in VRAM, then with the batch
 transferred each step, then with real JPEG decode and augmentation in
-DataLoader workers — so the loss splits cleanly into transfer, host, and
-what survives:
+DataLoader workers — so the loss splits cleanly into transfer, host, and what
+survives. Both operating systems have now been measured on it:
 
 ```
-    408.5 img/s   batch already in VRAM      <- the card's own ceiling
-                  + PCIe transfer, pinned       −2.5%
-    386.9 img/s   + real decode / augment       −2.8%
-                  = 94.7% of the ceiling survives being fed
+                                       stock-ubuntu    minimal-gentoo
+    batch already in VRAM               408.5 img/s      410.2 img/s   <- the card's own ceiling
+      + PCIe transfer, pinned                 −2.5%            −1.3%
+      + real decode / augment                 −2.8%            −2.5%
+    ------------------------------------------------------------------
+    survives being fed                  386.9 img/s      394.7 img/s
+                                              94.7%            96.2%
 ```
 
-(stock-ubuntu, mean of three runs; the efficiency figure spans 94.7–94.8%.)
+(Mean of three runs per side on a matched software stack. The efficiency
+figures span 94.7–94.8% and 96.1–96.3% — the ranges do not overlap, so the
+gap is real. Full tables below.)
 
 Image classification is the vehicle, not the point: JPEG decode and augment
 put measurable load on the host in a way token slicing does not, and the
@@ -89,6 +94,115 @@ pushes GPU-related validation onto bare metal rather than a VM.
 Reference ceilings for the RTX 3060, to be confirmed by measurement rather than
 trusted: ~12.7 TFLOPS FP32, ~25.5 TFLOPS dense tensor (bf16/fp16), 360 GB/s
 memory bandwidth, PCIe 4.0 x16.
+
+---
+
+## What has been measured
+
+Everything below runs on one matched software stack — torch 2.14.0,
+torchvision 0.29.0, Python 3.14.7, cuDNN 92400, driver 595.84 — so the kernel
+is the only variable. `results/` holds every run: **stock-ubuntu n=6,
+minimal-gentoo n=7**, the Gentoo side spread across three separate boots. A row
+counts as a difference only when the two min..max ranges do not overlap.
+
+### How much of the card this OS reaches
+
+```
+python3 -m gpubench utilization results/*minimal-gentoo*.json
+```
+
+| path | achieved | ceiling | reached |
+|---|---|---|---|
+| compute fp32 | 9.48 TFLOPS | 12.74 | 74.4% |
+| compute tf32 | 13.59 TFLOPS | 25.50 | 53.3% |
+| compute bf16 | 27.25 TFLOPS | 25.50 | 106.9% |
+| compute fp16 | 27.13 TFLOPS | 25.50 | 106.4% |
+| memory | 333.1 GB/s | 360.0 | 92.5% |
+| transfer h2d pinned | 24.58 GB/s | 25.0 | 98.3% |
+| transfer h2d pageable | 14.86 GB/s | 25.0 | 59.4% |
+| **training bf16 step** | **8.90 TFLOPS** | 25.50 | **34.9%** |
+
+Above 100% means the card boosted past the 1777 MHz reference clock the
+12.74 / 25.5 TFLOPS figures are derived from, not an error.
+
+Read the throttling before the compute rows: the card sat at its 170 W
+`sw_power_cap` for 73–75% of the GEMM sweep, on *both* operating systems.
+Those TFLOPS measure the power limit, not the OS — which is why no OS change
+is expected to move them, and none has.
+
+The training step at **34.9% of the bf16 ceiling** is the weakest path by a
+wide margin, and it is now known not to be OS noise.
+
+### What the minimal kernel changed
+
+| path | stock-ubuntu (n=6) | minimal-gentoo (n=7) | verdict |
+|---|---|---|---|
+| GEMM fp32 | 9.33 .. 9.54 TFLOPS | 9.40 .. 9.54 | overlap — same |
+| GEMM bf16 | 27.03 .. 27.49 TFLOPS | 26.97 .. 27.39 | overlap — same |
+| memory bandwidth | 331.9 .. 333.1 GB/s | 333.1 .. 333.1 | overlap — same |
+| train MFU | 34.5 .. 35.0 % | 34.8 .. 35.0 % | overlap — same |
+| train tok/s | 3841 .. 3893 | 3870 .. 3896 | overlap — same |
+| **PCIe pageable H2D** | 8.10 .. 8.97 GB/s | **14.81 .. 14.92** | **+71%** |
+| **PCIe pinned H2D** | 15.56 .. 22.97 GB/s | **24.58 .. 24.59** | **+21%** |
+| **kernel launch, eager** | 2.79 .. 2.90 µs | **3.04 .. 3.14** | **+8% slower** |
+| kernel launch, graphed | 0.89 .. 0.91 µs | 0.91 .. 0.92 | overlap — same |
+
+So the minimal kernel costs nothing on compute, memory or training throughput,
+wins large on host-to-device transfer, and loses a little on kernel dispatch.
+Graph capture cuts dispatch to 0.91 µs on both sides, so the launch regression
+is a structural weak point rather than a real ceiling.
+
+### The feed path decides which of those two matters
+
+The two real differences — transfer and dispatch — both live on the boundary
+between host and device, so the feed path is where they either cancel or
+compound. They do neither. Under load the transfer win shows up and the
+dispatch loss does not appear at all:
+
+| | stock-ubuntu (n=3) | minimal-gentoo (n=3) |
+|---|---|---|
+| ceiling, batch already in VRAM | 405.4 .. 410.1 img/s | 409.6 .. 410.5 |
+| **real pipeline** | 383.9 .. 388.7 img/s | **394.4 .. 395.2** |
+| **survives being fed** | 94.7 .. 94.8 % | **96.1 .. 96.3 %** |
+| transfer cost | 2.3 .. 2.7 % | **1.2 .. 1.5 %** |
+| host cost | 2.7 .. 2.9 % | 2.4 .. 2.6 % |
+| step time p99 / p50 | 1.017 .. 1.020 | **1.001** |
+
+Transfer cost is halved, which is the PCIe result surviving contact with a real
+workload. The −8% eager-launch regression never surfaces: a 3 µs dispatch
+cannot show up in a 158 ms step, and the Gentoo step is in fact the *faster* of
+the two (p50 158.4 ms against 160.7 ms). One of the two effects is simply the
+wrong size to matter under load.
+
+The DataLoader worker sweep says the same thing from the host side:
+
+```
+workers      0       2       4       8     img/s, mean of 3
+ubuntu   230.3   386.9   382.7   356.5
+gentoo   234.4   394.7   392.4   374.9
+```
+
+Both peak at 2 workers and degrade past the physical core count — the four-core
+CPU showing through, on either OS. Gentoo degrades less: at 8 workers Ubuntu's
+99th-percentile loader wait reached 194 ms on one run, against a 6.3 ms worst
+case on Gentoo.
+
+### The variance is the result the project was actually after
+
+| metric | ubuntu spread (n=6) | gentoo spread (n=7) |
+|---|---|---|
+| PCIe pinned H2D | **47.6%** | 0.04% |
+| PCIe pageable H2D | 10.7% | 0.74% |
+| memory bandwidth | 0.36% | 0.00% — identical ×7 |
+| train step stdev | up to 1.11 ms | 0.05 .. 0.15 ms |
+| feed step p99 / p50 | 1.017 .. 1.020 | 1.001 |
+
+Seven Gentoo runs across three boots put memory bandwidth at the same figure to
+one decimal and pinned PCIe inside a 0.01 GB/s window, while Ubuntu's pinned
+figure moves by half on the same hardware. That is item 6 of the table above —
+OS-level noise — and removing it is what this project set out to do. For a
+measurement harness it matters more than the means: a 48% swing is wide enough
+to hide every effect the later configuration arms are meant to detect.
 
 ---
 
@@ -140,6 +254,8 @@ scripts/
   12_restore_boot_entries.sh    recreate the EFI boot entries after NVRAM loss
   13_gentoo_preflight_and_run.sh  the whole Gentoo session in one command
                                   (on booted Gentoo; also at /root/run.sh)
+  14_install_target_runner.sh   put 13 on the target as /root/run.sh
+                                  (the only script that mounts the target rw)
 
 gpubench/                       the measurement harness
   spec.py                       the hardware ceilings, importable without torch
@@ -214,34 +330,38 @@ cable comes out and nothing else on the machine has changed.
       (`nvidia-smi` works, all four modules loaded, `exit_status=0`)
 - [x] `minimal-gentoo` measurement captured (`results/`)
 - [x] **Valid comparison on a matched stack, with repeats** — torch 2.14.0 /
-      Python 3.14.7 / cuDNN 92400 on both sides; Ubuntu n=3, Gentoo n=4 across
-      two boots. Compute, memory and training throughput are **unchanged** by
-      the stripped kernel; H2D transfer is **+73% pageable / +38% pinned**;
-      kernel launch is **+9% slower** (2% once graphed)
+      Python 3.14.7 / cuDNN 92400 on both sides; Ubuntu n=6, Gentoo n=7 across
+      three boots. Compute, memory and training throughput are **unchanged** by
+      the stripped kernel; H2D transfer is **+71% pageable / +21% pinned**;
+      kernel launch is **+8% slower** (no difference once graphed)
 - [x] **OS noise measurably removed** — Gentoo holds pinned PCIe inside a
-      0.01 GB/s window and memory bandwidth identical across four runs, where
-      Ubuntu swings 13% run to run on the same hardware. Item 6 below, caught
-- [x] **CPU→GPU feed path measured** (`gpubench/pipeline.py`) — on stock-ubuntu
+      0.01 GB/s window and memory bandwidth identical across seven runs, where
+      Ubuntu's pinned figure spans 47% on the same hardware. Item 6, caught
+- [x] **CPU→GPU feed path measured on both** (`gpubench/pipeline.py`) —
       **94.7%** of the card's ceiling survives a real decode/augment/transfer
-      pipeline (transfer −2.5%, host −2.8%), reproducible to ±0.05 pp over 3 runs
-- [ ] Take the feed path on Gentoo — no Gentoo run has it yet; the two known
-      kernel differences (PCIe +38/+73%, dispatch −9%) both live on that
-      boundary, so this is where they cancel or compound.
-      **Attempted 2026-09-18 10:52 and produced nothing**, for two independent
-      reasons: the machine booted with no network interface at all, and the
-      Gentoo checkout was three commits behind the `--feed-path` commit. Both
-      are now handled by `13_gentoo_preflight_and_run.sh`; see `HANDOFF.md`
+      pipeline on Ubuntu, **96.2%** on Gentoo, ranges disjoint. The transfer
+      win survives contact with a real workload (cost 2.5% → 1.3%); the
+      dispatch regression turns out to be the wrong size to matter under load.
+      Took three attempts to collect — see `HANDOFF.md` for why the first two
+      measured nothing, and what `13_gentoo_preflight_and_run.sh` now handles
 - [ ] **Explain why that boot's udev coldplug loaded no modules** — `r8169` and
       `nvidia_drm`, the two modules nothing names explicitly, were both absent,
       while the two named in `/etc/conf.d/modules` loaded fine. Every disk-side
       explanation was checked and cleared (alias, deps, firmware, blacklists,
-      rules, `USE=kmod`). **The next boot was fine on the same disk and kernel**,
-      so it is a race rather than a misconfiguration, and catching it means
-      being on the boot where it happens. `r8169` is now named explicitly,
+      rules, `USE=kmod`). **Every boot since has been fine on the same disk and
+      kernel** — seen once, then not on the three boots after it — so it is a
+      race rather than a misconfiguration, and catching it means being on the
+      boot where it happens. `13` captures `udevadm test` automatically on a
+      boot that fails. `r8169` is now named explicitly in `/etc/conf.d/modules`,
       which removes the dependency on the answer without being one
+- [ ] **`isolcpus` arm** — the next configuration to measure. The remaining
+      losses are both host-side and structural (four cores feeding 3584): the
+      training step at 34.9%, the −8% eager dispatch, and a worker sweep that
+      degrades past the physical core count. Core isolation is the one knob
+      aimed at exactly that
 - [ ] Raise the training step off **34.9%** of the bf16 ceiling — the weakest
       path by a wide margin, and now known not to be OS noise
-- [ ] `isolcpus` arm — `headless` and `performance-governor` after it
+- [ ] `headless` and `performance-governor` arms after `isolcpus`
 
 ### The firmware does not keep boot entries it did not create
 
@@ -285,6 +405,12 @@ fixing before any of them get blamed on something else:
 | `persistence_mode = Disabled` | the driver unloads between processes; clocks drop with it |
 | `transparent_hugepage = madvise` | project spec calls for THP off with explicit hugepages |
 | 358 MiB VRAM held by the desktop session | gone once the target boots headless |
+
+Three of the four are now confirmed recovered: Gentoo runs start with 11,776
+MiB of VRAM free against Ubuntu's 11,461–11,603, persistence mode is enabled,
+and the governor is set to `performance` by the preflight on every boot — it
+does not survive a reboot on either OS, which is why a script sets it rather
+than a person.
 
 Also worth noting: the card reports a maximum SM clock of 2130 MHz against the
 1777 MHz rated boost the 12.74 TFLOPS reference figure is derived from. The

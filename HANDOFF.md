@@ -22,9 +22,14 @@ The full pipeline was last run clean on 2026-09-18 at 09:02–09:05:
 10  boots to a login prompt on serial
 ```
 
-**It has now booted on bare metal, and the CUDA stack survived.** Booted
+**It has now booted on bare metal, and the CUDA stack survived.** First on
 2026-09-18 09:12–09:27 from the F11 menu; `09_gentoo_first_boot.sh` ran to
-completion with `exit_status=0`. The bundle is in `logs/from-target/`.
+completion with `exit_status=0`. Four more bare-metal boots since, and the
+CUDA stack has come up on every one of them — the two runs that produced no
+measurement failed on network and on a stale checkout, never on the driver.
+The most recent bundle is in
+`logs/from-target/` — it is overwritten by each collection, so anything worth
+keeping belongs in `results/` or in this file.
 
 ```
 nvidia-smi          WORKED - driver 595.84, CUDA 13.2, RTX 3060 seen
@@ -47,50 +52,96 @@ still leaving two thirds of the card unused if its MFU is 34%. Use:
 python3 -m gpubench utilization results/*minimal-gentoo*.json
 ```
 
-As measured on 2026-09-18, the weakest path is the training step at **34.8%**
-of the bf16 tensor ceiling. Compute, memory and pinned transfer are all close
-to the card's limits (92–106%); pageable H2D sits at 59.6%.
+As measured on 2026-09-18 over seven runs, the weakest path is the training
+step at **34.9%** of the bf16 tensor ceiling (34.8–35.0 across the seven).
+Compute, memory and pinned transfer are all close to the card's limits
+(92–107%); pageable H2D sits at 59.4%.
+
+The baseline comparison is now **complete**: device side and feed path, both
+operating systems, one matched stack, with repeats. What is left is the
+`isolcpus` arm — see "Do this next".
 
 ### What the OS was actually worth
 
-Measured 2026-09-18 on a matched stack — torch 2.14.0, Python 3.14.7,
-cuDNN 92400 on **both** sides, so the kernel is the only variable. Ubuntu ran
-three times (09:46–09:48), Gentoo four across two separate boots (09:25 and
-10:00–10:01). `results/` holds all seven. A row counts as a difference only
-when the two min..max ranges do not overlap.
+Measured 2026-09-18 on a matched stack — torch 2.14.0, torchvision 0.29.0,
+Python 3.14.7, cuDNN 92400, driver 595.84 on **both** sides, so the kernel is
+the only variable. Ubuntu ran six times (09:46–09:48 and 10:44–10:47), Gentoo
+seven across three separate boots (09:25, 10:00–10:01, 11:32–11:36).
+`results/` holds all thirteen. A row counts as a difference only when the two
+min..max ranges do not overlap.
 
-| path | ubuntu n=3 | gentoo n=4 | verdict |
+| path | ubuntu n=6 | gentoo n=7 | verdict |
 |---|---|---|---|
 | GEMM fp32 | 9.33 .. 9.54 TFLOPS | 9.40 .. 9.54 | overlap — same |
-| GEMM bf16 | 27.03 .. 27.49 TFLOPS | 26.97 .. 27.28 | overlap — same |
+| GEMM bf16 | 27.03 .. 27.49 TFLOPS | 26.97 .. 27.39 | overlap — same |
 | memory bandwidth | 331.9 .. 333.1 GB/s | 333.1 .. 333.1 | overlap — same |
-| train MFU | 34.80 .. 35.00 % | 34.80 .. 35.00 | overlap — same |
-| train tok/s | 3872 .. 3893 | 3870 .. 3896 | overlap — same |
-| **PCIe pageable H2D** | 8.10 .. 8.89 GB/s | **14.81 .. 14.90** | **+73%** |
-| **PCIe pinned H2D** | 15.56 .. 20.30 GB/s | **24.58 .. 24.59** | **+38%** |
-| **kernel launch (eager)** | 2.79 .. 2.85 µs | **3.04 .. 3.14** | **+9% slower** |
-| kernel launch (graphed) | 0.89 .. 0.90 µs | 0.91 .. 0.92 | +2% slower |
+| train MFU | 34.5 .. 35.0 % | 34.8 .. 35.0 | overlap — same |
+| train tok/s | 3841 .. 3893 | 3870 .. 3896 | overlap — same |
+| **PCIe pageable H2D** | 8.10 .. 8.97 GB/s | **14.81 .. 14.92** | **+71%** |
+| **PCIe pinned H2D** | 15.56 .. 22.97 GB/s | **24.58 .. 24.59** | **+21%** |
+| **kernel launch (eager)** | 2.79 .. 2.90 µs | **3.04 .. 3.14** | **+8% slower** |
+| kernel launch (graphed) | 0.89 .. 0.91 µs | 0.91 .. 0.92 | overlap — same |
 
 So the minimal kernel costs nothing on compute, memory or training throughput,
 wins large on host-to-device transfer, and loses a little on kernel dispatch.
-Graph capture cuts dispatch to 0.91 µs (3.3x), so the launch regression is a
-structural weak point rather than a real ceiling.
+Graph capture cuts dispatch to 0.91 µs (3.4x) on both sides, so the launch
+regression is a structural weak point rather than a real ceiling.
 
-**The variance is the more interesting result.** The minimal kernel is not
-just faster on transfer, it is close to deterministic:
+The earlier n=3/n=4 version of this table reported +73% / +38% / −9%. The
+verdicts did not change with three more Ubuntu runs and three more Gentoo runs;
+only the percentages moved, and they moved because **Ubuntu's spread widened**,
+not because Gentoo's did.
+
+### And what it was worth under load
+
+The feed path was measured on both sides on 2026-09-18 (Ubuntu 10:44–10:47,
+Gentoo 11:32–11:36, n=3 each). This is the measurement that decides which of
+the two device-side differences actually matters, because both of them live on
+the host/device boundary and the feed path is that boundary under load.
+
+| | ubuntu n=3 | gentoo n=3 |
+|---|---|---|
+| ceiling, batch already in VRAM | 405.4 .. 410.1 img/s | 409.6 .. 410.5 |
+| **real pipeline** | 383.9 .. 388.7 img/s | **394.4 .. 395.2** |
+| **efficiency** | 94.7 .. 94.8 % | **96.1 .. 96.3 %** |
+| transfer cost | 2.3 .. 2.7 % | **1.2 .. 1.5 %** |
+| host cost | 2.7 .. 2.9 % | 2.4 .. 2.6 % |
+| step p50 | 160.58 .. 162.19 ms | **158.26 .. 158.44** |
+| step p99/p50 | 1.017 .. 1.020 | **1.001** |
+
+**They do not cancel and they do not compound — one of them is the wrong size
+to matter.** Transfer cost is halved, which is the PCIe result surviving
+contact with a real workload. The −8% eager dispatch regression does not appear
+at all: 3 µs cannot show in a 158 ms step, and the Gentoo step is the faster of
+the two anyway. Worker sweep, mean of 3:
 
 ```
-PCIe pinned     ubuntu 15.56 .. 20.30  (±13%)     gentoo 24.58 .. 24.59  (±0.02%)
-PCIe pageable   ubuntu  8.10 ..  8.89  (±4.6%)    gentoo 14.81 .. 14.90  (±0.3%)
-memory          ubuntu 331.9 .. 333.1             gentoo 333.1 .. 333.1  (identical x4)
+workers      0       2       4       8     img/s
+ubuntu   230.3   386.9   382.7   356.5
+gentoo   234.4   394.7   392.4   374.9
 ```
 
-Four Gentoo runs across two boots put memory bandwidth at the same figure to
+Both peak at 2 and degrade past the physical core count — the four-core CPU,
+on either OS. Gentoo degrades less: at 8 workers Ubuntu's p99 loader wait hit
+194 ms on one run, against 6.3 ms worst case on Gentoo.
+
+**The variance is still the more interesting result.** The minimal kernel is
+not just faster on transfer, it is close to deterministic:
+
+```
+PCIe pinned     ubuntu 15.56 .. 22.97  (47.6%)   gentoo 24.58 .. 24.59  (0.04%)
+PCIe pageable   ubuntu  8.10 ..  8.97  (10.7%)   gentoo 14.81 .. 14.92  (0.74%)
+memory          ubuntu 331.9 .. 333.1  ( 0.4%)   gentoo 333.1 .. 333.1  (identical x7)
+train stdev     ubuntu up to 1.11 ms             gentoo 0.05 .. 0.15 ms
+feed p99/p50    ubuntu 1.017 .. 1.020            gentoo 1.001
+```
+
+Seven Gentoo runs across three boots put memory bandwidth at the same figure to
 one decimal, and pinned PCIe inside a 0.01 GB/s window, while Ubuntu's pinned
-figure moves 13% run to run on the same hardware. This is item 6 in the
-README's table — OS-level noise — and it is the thing the project set out to
-remove. For a measurement harness it matters more than the means: a 13% swing
-is wide enough to hide most of the effects the later arms are meant to detect.
+figure moves by half on the same hardware. This is item 6 in the README's table
+— OS-level noise — and it is the thing the project set out to remove. For a
+measurement harness it matters more than the means: a 48% swing is wide enough
+to hide every effect the later arms are meant to detect.
 
 An earlier comparison, made before the pin existed, reported GEMM regressions
 of −1.3% to −2.8% and a +59% pageable gain. The regressions were the torch
@@ -99,23 +150,70 @@ version, not the kernel, and vanished once the stacks matched — one of them
 `results/superseded/20260917T171657-stock-ubuntu-torch2.11.json`, out of the
 `results/*stock-ubuntu*.json` glob so it cannot be picked up by accident.
 
-One trap worth naming, because it has already caused a false alarm: step 10
-boots the installation **in QEMU**, with `snapshot=on` so the real disk is never
-written. Its serial console prints the same `gentoo-ml login:` banner the real
-machine does. Logging in there proves the getty works and nothing else — any
-work done inside it is discarded when the VM exits. If a `gentoo-ml login:` is
-on screen, check whether `00_run_pipeline.sh` is still running before concluding
-the machine has booted.
+It **can** still be picked up on purpose, though: the target's own clone has it
+under its original name, so it comes back inside every `logs/from-target/`
+bundle. Copy results out of a bundle by label, never with `*.json`. See "Do
+this next", step 3.
 
 ---
 
 ## Do this next
 
-**Boot Gentoo and take the feed-path measurement.** It is new, so no Gentoo
-run has it yet; the Ubuntu side already does. `09_gentoo_first_boot.sh` now
-passes `--feed-path`.
+**Boot the `isolcpus` arm and measure it.** The baseline comparison is finished
+— device side and feed path, both operating systems, matched stack, repeats —
+and every loss still on the table is host-side and structural: the training
+step at 34.9% of the bf16 ceiling, the −8% eager dispatch, and a worker sweep
+that degrades past the physical core count. Four cores feeding 3584 is this
+build's structural weak point, and core isolation is the one knob aimed at
+exactly that.
 
-### The 10:52 attempt failed twice over — read this before repeating it
+```
+# reboot, F11, pick Gentoo-ML-isolcpus.  Then, as root:
+/root/run.sh isolcpus          # preflight + 3 runs, one command
+
+# back on Ubuntu
+sudo ./scripts/11_collect_from_target.sh
+cp logs/from-target/results/*-isolcpus.json results/     # NOT *.json - see below
+python3 -m gpubench compare results/*minimal-gentoo*.json results/*isolcpus*.json
+python3 -m gpubench utilization results/*isolcpus*.json
+```
+
+Three things to get right, in this order:
+
+1. **`Gentoo-ML-isolcpus` must come from the NVRAM entry.** The `isolcpus=2,3
+   nohz_full=2,3 rcu_nocbs=2,3` arguments live only in that entry's
+   LoadOptions. If the firmware has discarded it, the `UEFI OS` fallback still
+   boots — but it boots the *builtin* command line, i.e. without isolation, and
+   the run would silently re-measure `minimal-gentoo` under a different label.
+   Run `sudo ./scripts/12_restore_boot_entries.sh` from Ubuntu first if the
+   entry is missing from the F11 menu.
+2. **Confirm the isolation actually took**, before trusting anything. It has
+   been empty on all thirteen runs so far, because every one of them booted the
+   plain arm:
+   ```
+   cat /proc/cmdline                       # isolcpus= present?
+   python3 -m gpubench env | grep -E 'isolated|nohz_full'
+   ```
+3. **Copy results back by label, never with `*.json`.**
+   `logs/from-target/results/` also contains `20260917T171657-stock-ubuntu.json`
+   — the torch 2.11 run that was deliberately moved to `results/superseded/`
+   here. A blanket `cp` puts it back under its original name, inside the
+   `results/*stock-ubuntu*.json` glob, and silently poisons every future
+   baseline with three releases of torch drift. That confound is the reason the
+   `compare` stack check exists; do not reintroduce it through a wildcard.
+
+Expect the feed path and the dispatch number to move, and expect compute and
+memory not to. Take three runs; the Gentoo side is deterministic enough that
+three is plenty.
+
+---
+
+## How the feed-path measurement was finally collected
+
+Kept because it took three attempts and each failure was a different class of
+problem. If a future arm produces nothing, the cause is likely in here.
+
+### The 10:52 attempt failed twice over
 
 A run was attempted on 2026-09-18 at 10:52 and produced no measurement. Two
 independent causes, either of which was enough on its own:
@@ -178,97 +276,50 @@ The `--feed-path` guard did its job: the stale checkout was caught and the run
 stopped instead of quietly re-measuring the old baseline and looking like a
 success.
 
-This is the measurement that answers what the CPU↔GPU path costs, and it is
-the one place the two kernels still might differ in a way that matters.
-Everything measured so far on the device side came out identical — compute,
-memory, training throughput — while the two real differences (PCIe transfer
-+38/+73%, dispatch −9%) both live on the boundary between host and device.
-The feed path is that boundary under load, so it is where those two effects
-either cancel or compound.
+### The 11:30 run, which worked
 
-On Ubuntu the answer is **94.7% of the card's ceiling survives being fed**
-(transfer −2.5%, host −2.8%, n=3, spanning 94.7–94.8%). The GPU sits blocked on
-the loader 2.4% of wall time, and the worker sweep peaks at 2 and degrades past
-the physical core count:
+Third attempt, and it went straight through — 11:30:01 to 11:36:04, three runs,
+`exit_status=0`. The preflight log records each fix doing its job:
 
 ```
-workers   0: 230.3    2: 386.9    4: 382.7    8: 356.5   img/s   (mean of 3)
+r8169 loaded: yes            udev coldplug worked this boot
+default route present        192.168.0.18/24 on enp3s0
+/etc/conf.d/modules          already names r8169 (persisted at 11:22)
+git pull                     3 untracked results preserved, then a8d1d0e -> c0d10a8
+09 carries --feed-path       guard satisfied
+CPU governor                 powersave -> performance
+swap                         off
 ```
 
-That baseline is reproducible to ±0.05 percentage points, which makes it a
-sensitive instrument: a real difference on the Gentoo side will be unmissable.
-Whether the minimal kernel does better is unmeasured.
+Two things in that list are worth noticing. The governor was on `powersave`
+again despite having been set before — it does not survive a reboot, and only
+the preflight catches it. And `13` moved the three untracked result files out
+of the way rather than deleting them, which is what let the pull through.
 
-```
-# reboot, F11, pick Gentoo-ML.  Then, as root:
+Three lessons, in the order they cost time:
 
-# --- preflight: network, then the code, then the clocks -------------------
-ip -brief addr                      # only lo listed? then r8169 never loaded
+- **A runbook step that only a human remembers is not a step.** The `git pull`
+  was in the prose and not in any script, and it was skipped. It is now inside
+  `13`, along with the network repair and the governor.
+- **A guard that stops a run is cheaper than a run that produces the wrong
+  number.** The `--feed-path` check turned a silent re-measurement of the old
+  baseline into a loud abort with a named cause.
+- **Bootstrap scripts cannot arrive through the thing they bootstrap.** `13`
+  is what repairs the network and updates the checkout, so it cannot itself
+  come from the checkout. `14_install_target_runner.sh` places it on the target
+  as `/root/run.sh` from Ubuntu; re-run it after changing `13`.
 
-# Diagnose BEFORE fixing. The evidence is the unloaded state, and it is gone
-# the moment the module comes up. This is also the one diagnosis that cannot
-# be done from Ubuntu against a cold disk.
-udevadm test /sys/bus/pci/devices/0000:03:00.0 2>&1 | tail -30
-modprobe -v r8169; dmesg | tail -20
+Operational notes that still apply to every arm:
 
-rc-service dhcpcd restart
-ip route get 1.1.1.1                # must succeed before anything else works
-
-# make it survive the next boot too (06 writes this, but only in the chroot)
-grep -q r8169 /etc/conf.d/modules || \
-    sed -i 's/^modules="nvidia nvidia_uvm"$/modules="nvidia nvidia_uvm r8169"/' \
-        /etc/conf.d/modules
-
-cd /root/ai-specialized-os-prototype
-git pull                            # REQUIRED - see above; --feed-path lives in 39a2de7
-grep -c feed-path scripts/09_gentoo_first_boot.sh    # must be non-zero
-
-cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor   # must be performance
-
-# --- measure ---------------------------------------------------------------
-for i in 1 2 3; do ./scripts/09_gentoo_first_boot.sh; done
-
-# back on Ubuntu
-sudo ./scripts/11_collect_from_target.sh
-cp logs/from-target/results/*.json results/
-python3 -m gpubench compare results/*stock-ubuntu*.json results/*minimal-gentoo*.json
-```
-
-`09` now tees its own output into the bundle as
-`run-<timestamp>-<label>.log`, one per run, so a failure says which check
-rejected the machine instead of leaving it to be inferred from `ip.txt`.
-`summary.txt` names the log for the run it describes.
-
-The first run on Gentoo will install `torchvision` and build the JPEG corpus
-under `/dev/shm`; both are cached afterwards. The corpus must stay on tmpfs —
-Ubuntu runs from an SSD and the target from a 5400rpm HDD, and that is the one
-confound this comparison cannot absorb.
-
-**Then boot the `isolcpus` arm.** The training step sits at **34.9%** of the
-bf16 ceiling and is the weakest path by a wide margin. Nothing measured so far
-is OS noise, so the remaining loss is structural: four cores feeding 3584,
-which is exactly what `isolcpus` is meant to protect. The −9% eager-launch
-regression points the same way — dispatch is the one place the minimal kernel
-loses, and dispatch is what core isolation defends.
-
-```
-# reboot, F11, pick Gentoo-ML-isolcpus  (needs the NVRAM entry; if it is gone,
-# sudo ./scripts/12_restore_boot_entries.sh from Ubuntu first)
-for i in 1 2 3; do ./scripts/09_gentoo_first_boot.sh isolcpus; done
-```
-
-The script takes the label as its first argument, so each arm keeps its own
-results instead of landing on top of the baseline just established. Confirm
-the isolation actually took before trusting the numbers — `env.capture()`
-records `cpu.isolated` and `cpu.nohz_full`, and they were empty on every run
-so far:
-
-```
-python3 -m gpubench env | grep -E 'isolated|nohz_full'
-```
-
-Take three runs per arm. The Gentoo side is deterministic enough that three is
-plenty; it is Ubuntu that needs them.
+- `09` tees its own output into the bundle as `run-<timestamp>-<label>.log`,
+  one per run, so a failure says which check rejected the machine instead of
+  leaving it to be inferred from `ip.txt`. `summary.txt` names the log for the
+  run it describes.
+- The first run of a new arm installs nothing new (torchvision is already
+  there) but does rebuild the JPEG corpus under `/dev/shm` if the tmpfs was
+  cleared by the reboot — about 30 s. The corpus **must** stay on tmpfs:
+  Ubuntu runs from an SSD and the target from a 5400rpm HDD, and that is the
+  one confound this comparison cannot absorb.
 
 ### Reading the comparison
 
@@ -316,16 +367,21 @@ PYTHONPATH=$PWD ~/miniconda3/envs/gpubench-314/bin/python -m gpubench run \
    section before suspecting hardware. It has been fine every time so far.
 2. Log in as `root`.
 3. ```
-   # first time only
-   git clone https://github.com/TechieQuokka/ai-specialized-os-prototype
-   # every time after that - this checkout is NOT the one you edit on Ubuntu
-   cd ai-specialized-os-prototype && git pull
-   ./scripts/09_gentoo_first_boot.sh
+   /root/run.sh [label]        # default label: minimal-gentoo
    ```
-   **The `git pull` is load-bearing.** This clone is a separate working copy
-   that only receives changes through GitHub, and it has already been three
-   commits behind at run time once — see "The 10:52 attempt" above. Push from
-   Ubuntu before rebooting, pull here before running.
+   This is `13_gentoo_preflight_and_run.sh`, placed there by
+   `14_install_target_runner.sh` from Ubuntu. It repairs the network, persists
+   `r8169`, pulls the checkout, verifies the pulled code carries what the run
+   needs, sets the governor, swaps off, then runs `09` three times.
+
+   **The `git pull` inside it is load-bearing.** `/root/ai-specialized-os-prototype`
+   is a separate working copy that only receives changes through GitHub, and it
+   has already been three commits behind at run time once — see below. Push
+   from Ubuntu before rebooting.
+
+   Doing it by hand instead is `cd /root/ai-specialized-os-prototype && git pull
+   && ./scripts/09_gentoo_first_boot.sh`, but then the governor, the network and
+   the staleness check are back to being things someone has to remember.
 
    The script verifies the boot, installs the **pinned** torch (replacing a
    mismatched one if it finds it), runs the benchmark, and compares against the
@@ -505,9 +561,17 @@ it establishes the mounts and syncs the scripts into the chroot.
 | `10_vm_smoke_test.sh` | host | QEMU boot test, non-destructive |
 | `11_collect_from_target.sh` | host | Read `/root/handoff` off the target |
 | `12_restore_boot_entries.sh` | host | Recreate the EFI boot entries after NVRAM loss |
+| `13_gentoo_preflight_and_run.sh` | **booted Gentoo** | Network, checkout, governor, then N× `09` |
+| `14_install_target_runner.sh` | host | Put 13 on the target as `/root/run.sh` |
 
 01, 03 and 04 are done and do not need re-running. 02, 05–08 and 12 are
 idempotent.
+
+`14` is the only script in the project that mounts the target **read-write**
+from Ubuntu, so it checks harder than the read-only collectors do — serial,
+model, not-the-live-root, `/etc/gentoo-release` present, a repo clone present —
+and writes exactly one file. Re-run it whenever `13` changes; the copy does not
+update by itself, which is the cost of it being the bootstrap.
 
 ---
 
@@ -589,38 +653,51 @@ python3 -m gpubench compare results/a.json results/b.json
 
 ### `stock-ubuntu` baseline (committed, `results/`)
 
+Mean of the six matched-stack runs (torch 2.14.0). The figures the project
+quoted before 2026-09-18 09:46 came from the torch 2.11 run now in
+`results/superseded/` and should not be carried forward.
+
 ```
-fp32     9.52 TFLOPS   74.7% of spec   1.00x
-tf32    13.62 TFLOPS   53.4%           1.43x
-bf16    27.34 TFLOPS  107.2%           2.87x
-fp16    27.42 TFLOPS  107.5%           2.88x
+fp32     9.45 TFLOPS   74.2% of spec   1.00x
+tf32    13.56 TFLOPS   53.2%           1.44x
+bf16    27.26 TFLOPS  106.9%           2.88x
+fp16    27.14 TFLOPS  106.4%           2.87x
 
-memory bandwidth   332.4 GB/s  (92.3% of 360)
-PCIe H2D           21.64 GB/s pinned  vs  9.36 GB/s pageable   (2.31x)
-kernel launch      3.03 us eager  ->  0.91 us graphed          (3.31x)
-training step      MFU 34.5%, 3843 tok/s, 9934 MiB peak VRAM
+memory bandwidth   332.8 GB/s  (92.4% of 360)
+PCIe H2D           20.25 GB/s pinned  vs  8.69 GB/s pageable   (2.33x)
+kernel launch      2.86 us eager  ->  0.90 us graphed          (3.18x)
+training step      MFU 34.9%, 3878 tok/s, 9934 MiB peak VRAM
+feed path          94.7% of the card's ceiling survives being fed
 
-throttling: sw_power_cap for 54% of the GEMM sweep
+throttling: sw_power_cap for 54-77% of the GEMM sweep
 ```
 
 **Read the throttling line first.** The card sat at its 170 W power cap for
-more than half the sweep, so those achieved-TFLOPS figures measure the power
-limit, not the code. Without that telemetry, fp32 at 74.7% would have looked
-like inefficient code.
+most of the sweep, so those achieved-TFLOPS figures measure the power limit,
+not the code. Without that telemetry, fp32 at 74.2% would have looked like
+inefficient code. Gentoo throttles the same way on the same sweep (75%), which
+is why no OS change moves the compute rows and none has.
 
 ### What the OS can and cannot recover
 
 Because the power cap dominates, a minimal OS will **not** move GEMM TFLOPS
-much. What it can recover is host-side:
+much. That prediction has now been tested and held — compute, memory and
+training throughput all came back identical. What it does recover is host-side,
+and all four of these are confirmed:
 
-- **473 MiB VRAM** held by the desktop session (`nvidia-drm.modeset=0`)
+- **473 MiB VRAM** held by the desktop session (`nvidia-drm.modeset=0`) —
+  Gentoo runs start with 11,776 MiB free against Ubuntu's 11,461–11,603
 - **CPU governor** — stock Ubuntu was on `powersave`, throttling the cores that
-  feed the GPU
+  feed the GPU. Note it does not survive a reboot on Gentoo either; the
+  preflight in `13` sets it every time, and caught it on `powersave` again at
+  11:30
 - **persistence mode** — was disabled; `nvidia-persistenced` is now enabled
-- **scheduler jitter** — visible in `step_time_stdev`
+- **scheduler jitter** — the largest single effect, and visible in three
+  independent places: `step_time_stdev` (1.11 ms → 0.05 ms), PCIe pinned spread
+  (47.6% → 0.04%), and feed-path step p99/p50 (1.02 → 1.001)
 
-Set expectations accordingly: this project recovers host overhead and VRAM, not
-the GPU compute ceiling.
+Set expectations accordingly: this project recovers host overhead, VRAM and
+run-to-run variance, not the GPU compute ceiling.
 
 ### A spec correction worth carrying forward
 
@@ -646,16 +723,30 @@ about 2.9 GB.
 
 ---
 
-## Not yet verified — bare metal only
+## What the VM smoke test cannot tell you
 
-1. **Which framebuffer driver the firmware hands over.** Untestable in QEMU.
+It covers kernel boot, AHCI, GPT scan, ext4 root mount with no initramfs,
+OpenRC, udev, dhcpcd, sshd, a login prompt, and absence of panics. It cannot
+cover anything involving the actual card:
+
+1. **Which framebuffer driver the firmware hands over.** `-kernel` boot hands
+   over no framebuffer at all, so this is structurally untestable in QEMU.
+   Verified on bare metal only by the console coming up.
 2. **NVIDIA module load and `nvidia-smi`.** No GPU in the VM, so
-   `nvidia-persistenced` failing there is expected; on bare metal it would mean
-   the driver did not attach.
+   `nvidia-persistenced` failing there is expected and means nothing. On bare
+   metal the same failure would mean the driver did not attach.
+   **Verified on bare metal 2026-09-18** — all four modules, persistence
+   enabled.
 3. **CUDA on the minimal kernel.** The question the prototype exists to answer.
+   **Verified 2026-09-18**, then measured thirteen times.
 
-The VM smoke test does cover: kernel boot, AHCI, GPT scan, ext4 root mount with
-no initramfs, OpenRC, udev, dhcpcd, sshd, and absence of panics.
+And the trap that follows from 1–3, because it has already caused a false
+alarm: step 10 boots the installation **in QEMU** with `snapshot=on`, so the
+real disk is never written — but its serial console prints the same
+`gentoo-ml login:` banner the real machine does. Logging in there proves the
+getty works and nothing else; any work done inside it is discarded when the VM
+exits. If a `gentoo-ml login:` is on screen, check whether
+`00_run_pipeline.sh` is still running before concluding the machine has booted.
 
 ---
 
@@ -672,13 +763,13 @@ no initramfs, OpenRC, udev, dhcpcd, sshd, and absence of panics.
 
 ## How the bugs went, and what changed
 
-Thirteen bugs during this build. Two were real system-configuration problems
+Fifteen bugs during this build. Two were real system-configuration problems
 (`root=UUID=` without an initramfs, and the missing `efi-framebuffer` fallback
-driver). The other eleven were all script orchestration: source-versus-deployed
+driver). The other thirteen were all script orchestration: source-versus-deployed
 copies drifting, mount preconditions, and success being announced rather than
 verified.
 
-Four patterns worth not repeating:
+Five patterns worth not repeating:
 
 - **Writing a parser against an assumed output format.** `efibootmgr` prints the
   device path after the label, so an anchored `label$` match never fired and
@@ -693,6 +784,13 @@ Four patterns worth not repeating:
   implies `root=PARTUUID=`; "headless" implies the console still needs a
   framebuffer driver. When a constraint is chosen, write it down and check what
   else it touches.
+- **A step that lives only in prose.** The `git pull` on the target was
+  documented in this file and in no script, and it was skipped on the first
+  attempt at the feed-path measurement — costing a boot. The fix was not a
+  louder warning but moving it into `13`, together with the network repair and
+  the governor. The same applies to the `cp logs/from-target/results/*.json`
+  line that used to be here: it silently undid the torch-2.11 supersede, and a
+  wildcard in a runbook is a bug waiting for someone to run it verbatim.
 
 - **Code exercised only on the clean path.** Both of 2026-09-18's bugs were
   this, and both blocked *resuming* rather than starting. 07 read
