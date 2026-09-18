@@ -113,7 +113,40 @@ the machine has booted.
 
 **Boot Gentoo and take the feed-path measurement.** It is new, so no Gentoo
 run has it yet; the Ubuntu side already does. `09_gentoo_first_boot.sh` now
-passes `--feed-path`, so simply re-running it collects everything.
+passes `--feed-path`.
+
+### The 10:52 attempt failed twice over — read this before repeating it
+
+A run was attempted on 2026-09-18 at 10:52 and produced no measurement. Two
+independent causes, either of which was enough on its own:
+
+**1. No network.** The machine booted with no interface at all — only `lo`.
+`09` aborted at its default-route check before installing anything. Every
+disk-side explanation was checked and cleared: `r8169.ko` installed,
+`modules.alias` carrying `pci:v000010ECd00008125…  r8169`, `modules.dep`
+showing no dependencies, `PHYLIB`/`REALTEK_PHY` built in, `rtl8125a-3.fw`
+present, nothing blacklisting it, `80-drivers.rules` intact, `systemd-utils`
+built with `USE=kmod`. `dmesg` never mentions `r8169`, so modprobe was never
+called.
+
+What that boot actually shows is that **udev coldplug loaded no modules at
+all**: `nvidia` appears at 15.2 s, which is the `modules` service at the `boot`
+runlevel loading it by name, not `udev-trigger` at `sysinit` matching its
+modalias. `nvidia_drm`, the other module nothing names explicitly, is missing
+too. Why coldplug did nothing is **still unknown** and needs a live boot to
+diagnose — see the preflight below.
+
+`06_nvidia_driver.sh` now names `r8169` in `/etc/conf.d/modules` so the one
+network interface no longer depends on coldplug working. That file is written
+in the chroot, so the change is not on the target yet; the preflight below
+applies it in place, which is cheaper than re-running 06.
+
+**2. The clone was three commits stale.** The Gentoo side is a *separate
+checkout* at `/root/ai-specialized-os-prototype`, cloned from GitHub. Its HEAD
+was `a8d1d0e`, and `--feed-path` arrived in `39a2de7`. Even with working
+network, that run would have re-measured the existing baseline and produced
+nothing new. **`git pull` is a required step, not a tidiness step** — it was
+missing from this runbook, which is why it was missed.
 
 This is the measurement that answers what the CPU↔GPU path costs, and it is
 the one place the two kernels still might differ in a way that matters.
@@ -137,13 +170,44 @@ sensitive instrument: a real difference on the Gentoo side will be unmissable.
 Whether the minimal kernel does better is unmeasured.
 
 ```
-# reboot, F11, pick Gentoo-ML
+# reboot, F11, pick Gentoo-ML.  Then, as root:
+
+# --- preflight: network, then the code, then the clocks -------------------
+ip -brief addr                      # only lo listed? then r8169 never loaded
+
+# Diagnose BEFORE fixing. The evidence is the unloaded state, and it is gone
+# the moment the module comes up. This is also the one diagnosis that cannot
+# be done from Ubuntu against a cold disk.
+udevadm test /sys/bus/pci/devices/0000:03:00.0 2>&1 | tail -30
+modprobe -v r8169; dmesg | tail -20
+
+rc-service dhcpcd restart
+ip route get 1.1.1.1                # must succeed before anything else works
+
+# make it survive the next boot too (06 writes this, but only in the chroot)
+grep -q r8169 /etc/conf.d/modules || \
+    sed -i 's/^modules="nvidia nvidia_uvm"$/modules="nvidia nvidia_uvm r8169"/' \
+        /etc/conf.d/modules
+
+cd /root/ai-specialized-os-prototype
+git pull                            # REQUIRED - see above; --feed-path lives in 39a2de7
+grep -c feed-path scripts/09_gentoo_first_boot.sh    # must be non-zero
+
+cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor   # must be performance
+
+# --- measure ---------------------------------------------------------------
 for i in 1 2 3; do ./scripts/09_gentoo_first_boot.sh; done
+
 # back on Ubuntu
 sudo ./scripts/11_collect_from_target.sh
 cp logs/from-target/results/*.json results/
 python3 -m gpubench compare results/*stock-ubuntu*.json results/*minimal-gentoo*.json
 ```
+
+`09` now tees its own output into the bundle as
+`run-<timestamp>-<label>.log`, one per run, so a failure says which check
+rejected the machine instead of leaving it to be inferred from `ip.txt`.
+`summary.txt` names the log for the run it describes.
 
 The first run on Gentoo will install `torchvision` and build the JPEG corpus
 under `/dev/shm`; both are cached afterwards. The corpus must stay on tmpfs —
@@ -222,13 +286,21 @@ PYTHONPATH=$PWD ~/miniconda3/envs/gpubench-314/bin/python -m gpubench run \
    section before suspecting hardware. It has been fine every time so far.
 2. Log in as `root`.
 3. ```
+   # first time only
    git clone https://github.com/TechieQuokka/ai-specialized-os-prototype
-   cd ai-specialized-os-prototype && ./scripts/09_gentoo_first_boot.sh
+   # every time after that - this checkout is NOT the one you edit on Ubuntu
+   cd ai-specialized-os-prototype && git pull
+   ./scripts/09_gentoo_first_boot.sh
    ```
-   It verifies the boot, installs the **pinned** torch (replacing a mismatched
-   one if it finds it), runs the benchmark, and compares against the stock
-   baseline. It writes `/root/handoff/` from an EXIT trap, so diagnostics
-   survive even if it aborts early.
+   **The `git pull` is load-bearing.** This clone is a separate working copy
+   that only receives changes through GitHub, and it has already been three
+   commits behind at run time once — see "The 10:52 attempt" above. Push from
+   Ubuntu before rebooting, pull here before running.
+
+   The script verifies the boot, installs the **pinned** torch (replacing a
+   mismatched one if it finds it), runs the benchmark, and compares against the
+   stock baseline. It writes `/root/handoff/` from an EXIT trap — including a
+   full log of its own output — so diagnostics survive even if it aborts early.
 4. Reboot back to Ubuntu (no F11).
 5. ```
    sudo ./scripts/11_collect_from_target.sh
@@ -252,7 +324,8 @@ been written to at any point in this project.
 | Kernel panic | Photograph the screen |
 | No `nvidia` in `lsmod` | Try `modprobe nvidia nvidia_uvm` and read the error |
 | `nvidia-smi` fails | Something is missing from the kernel config |
-| No IP from `ip a` | `rc-service dhcpcd restart` |
+| No IP from `ip a`, interface listed | `rc-service dhcpcd restart` |
+| No interface at all, only `lo` | `r8169` never loaded — `modprobe r8169` first, *then* restart dhcpcd. Seen on 2026-09-18; cause unknown, see "The 10:52 attempt" |
 
 ### When the disk vanishes from the boot menu
 

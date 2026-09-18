@@ -111,8 +111,28 @@ say "Configuring module autoload (OpenRC)"
 cat > /etc/conf.d/modules <<'EOF'
 # nvidia_uvm is what CUDA actually talks to; loading it at boot avoids paying
 # the module load on the first process that touches the GPU.
-modules="nvidia nvidia_uvm"
+#
+# r8169 is named here because on 2026-09-18 a boot came up with no network at
+# all - only lo, no interface for the RTL8125. Everything that would explain
+# it checked out: the module was installed, modules.alias carried
+# "pci:v000010ECd00008125... r8169", modules.dep showed no dependencies,
+# 80-drivers.rules was intact, the firmware was present and nothing
+# blacklisted it. dmesg never mentioned r8169 at all, so modprobe was never
+# called. That boot's udev coldplug loaded no modules whatsoever - nvidia came
+# up at the boot runlevel from this very file, not from udev at sysinit.
+#
+# Why coldplug did nothing is still unknown. Naming the module here does not
+# answer that; it removes the dependency on the answer. This machine has one
+# network interface, and a benchmark run that cannot reach PyPI aborts before
+# it measures anything.
+modules="nvidia nvidia_uvm r8169"
 EOF
+
+# Read it back. Writing the file is not the same as the file being right, and
+# this one is the only thing standing between a boot and having no network.
+grep -qw 'r8169' /etc/conf.d/modules \
+    || die "r8169 missing from /etc/conf.d/modules - the machine could boot with no network"
+echo "  autoload verified: $(grep '^modules=' /etc/conf.d/modules)"
 
 # --- persistence daemon -----------------------------------------------------
 if rc-service --exists nvidia-persistenced 2>/dev/null; then

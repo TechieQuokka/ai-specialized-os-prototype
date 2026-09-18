@@ -163,6 +163,11 @@ assert "kernel: network module installed" \
        "${LOG_DIR}/05_configure_kernel.log" 'Network driver present'
 assert "nvidia: nvidia.ko and nvidia-uvm.ko built" \
        "${LOG_DIR}/06_nvidia_driver.log" 'nvidia-uvm +OK'
+# 2026-09-18: a boot came up with only lo because udev coldplug loaded no
+# modules at all. The cause is still unknown; naming r8169 for OpenRC to load
+# by hand is what makes the network independent of it.
+assert "network: r8169 named for autoload, not left to udev" \
+       "${LOG_DIR}/06_nvidia_driver.log" 'autoload verified:.*r8169'
 # The inverse of assert: the pattern must NOT appear. Used for the failure
 # modes that are invisible when they happen - a stale root=UUID= entry looks
 # like a successful run right up until the kernel panics.

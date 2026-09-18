@@ -57,6 +57,28 @@ bad() { printf '  [FAIL] %s\n' "$*"; }
 # ---------------------------------------------------------------------------
 readonly HANDOFF="/root/handoff"
 
+# Preconditions first, because the logging below writes into /root and a
+# non-root invocation would otherwise abort on "mkdir: permission denied"
+# instead of saying what is actually wrong.
+[ "$(id -u)" -eq 0 ] || die "must run as root"
+[ -f /etc/gentoo-release ] || die "this runs on the Gentoo system, not the Ubuntu host"
+[ -d /mnt/gentoo/usr ] && die "this looks like the chroot, not a booted Gentoo system"
+
+# Everything this script prints goes into the bundle too. Without it, a run
+# that aborts hands back dmesg, lsmod and ip.txt but no record of which check
+# rejected the machine. On 2026-09-18 the 10:52 run came back as
+# "exit_status=1" and nothing else, and the failing check - no default route,
+# because no network interface existed - had to be reconstructed from the
+# evidence files. The bundle should say what happened, not merely contain
+# enough material to work it out.
+#
+# One log per run, named by start time, so `for i in 1 2 3` does not overwrite
+# the first failure with the last. 11_collect_from_target.sh copies the whole
+# directory, so they all come back.
+mkdir -p "$HANDOFF"
+readonly RUN_LOG="${HANDOFF}/run-$(date +%Y%m%dT%H%M%S)-${LABEL}.log"
+exec > >(tee -a "$RUN_LOG") 2>&1
+
 collect_handoff() {
     local rc=$?
     mkdir -p "$HANDOFF" 2>/dev/null || return 0
@@ -66,6 +88,7 @@ collect_handoff() {
         echo "collected=$(date -Is)"
         echo "kernel=$(uname -r)"
         echo "cmdline=$(cat /proc/cmdline 2>/dev/null)"
+        echo "run_log=$(basename "$RUN_LOG")"
     } > "${HANDOFF}/summary.txt" 2>/dev/null
 
     dmesg                        > "${HANDOFF}/dmesg.txt"        2>&1 || true
@@ -89,10 +112,6 @@ collect_handoff() {
     ls -la "$HANDOFF" 2>/dev/null | tail -n +2 | sed 's/^/    /'
 }
 trap collect_handoff EXIT
-
-[ "$(id -u)" -eq 0 ] || die "must run as root"
-[ -f /etc/gentoo-release ] || die "this runs on the Gentoo system, not the Ubuntu host"
-[ -d /mnt/gentoo/usr ] && die "this looks like the chroot, not a booted Gentoo system"
 
 failures=0
 
@@ -153,8 +172,20 @@ fi
 say "Tuning state"
 gov="$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo unknown)"
 printf '  %-26s %s\n' "cpufreq governor" "$gov"
-[ "$gov" = "performance" ] && ok "governor is performance (stock Ubuntu was powersave)" \
-    || bad "governor is ${gov}, expected performance"
+# Counted, not just printed. This used to call bad() without touching
+# $failures, so a machine on powersave printed [FAIL] and then went on to
+# announce "All checks passed" and measure anyway - the same
+# announce-success-without-verifying pattern the rest of this build has been
+# bitten by. The governor moves the clocks that feed the GPU, so a run taken
+# on the wrong one is not comparable to the baseline.
+# Recover with: cpupower frequency-set -g performance
+#           or: echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+if [ "$gov" = "performance" ]; then
+    ok "governor is performance (stock Ubuntu was powersave)"
+else
+    bad "governor is ${gov}, expected performance - results would not be comparable"
+    failures=$((failures+1))
+fi
 
 printf '  %-26s %s\n' "isolated cpus" "$(cat /sys/devices/system/cpu/isolated 2>/dev/null || echo none)"
 printf '  %-26s %s\n' "nohz_full" "$(cat /sys/devices/system/cpu/nohz_full 2>/dev/null || echo none)"
