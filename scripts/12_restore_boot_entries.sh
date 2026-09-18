@@ -19,17 +19,28 @@
 #
 #   When that happens the target disk disappears from the F11 boot menu
 #   entirely, which reads like a dead drive. It is not: the firmware simply has
-#   nothing telling it this disk is bootable. Most firmwares will only offer a
-#   disk with no NVRAM entry if the ESP carries the removable-media fallback
-#   path \EFI\BOOT\BOOTX64.EFI, and this ESP deliberately does not.
+#   nothing telling it this disk is bootable. That is why 07 also installs the
+#   kernel at the removable-media fallback path \EFI\BOOT\BOOTX64.EFI, which
+#   the firmware's own scan finds and regenerates as "UEFI OS". Booting that
+#   path passes no LoadOptions, but 05 compiles the command line into the image
+#   as CONFIG_CMDLINE, so it boots the plain configuration rather than panicking
+#   with no root=. Restoring the entries below is therefore about *selecting a
+#   configuration*, not about being able to boot at all.
 #
-#   The fallback path is not a fix here, which is worth writing down so it is
-#   not attempted later. This is an EFI-stub boot with no bootloader, so the
-#   kernel command line is carried in the boot entry's LoadOptions. Booting the
-#   fallback path passes no LoadOptions, the kernel comes up with no root=, and
-#   with no initramfs to fall back on it panics. The kernel is not built with
-#   CONFIG_CMDLINE either, so there is nothing embedded to rescue it. Restoring
-#   the NVRAM entries is the only thing that actually boots.
+# WHY TWO COPIES OF THE SAME KERNEL
+#   This board drops a boot entry whose loader path duplicates one it already
+#   has, keeping the first and deleting the rest. Observed twice on 2026-09-18:
+#   Gentoo-ML and Gentoo-ML-isolcpus were written together, verified by reading
+#   NVRAM back, and after one POST only Gentoo-ML remained - while UEFI OS and
+#   Gentoo-ML, which point at different files on the same partition, both
+#   survived. LoadOptions are not part of what the firmware considers distinct,
+#   so two entries differing only in their command line cannot both exist.
+#
+#   Since the command line is the entire point of the second entry - the A/B
+#   test is one kernel booted two ways - the way out is to give it its own file.
+#   The same image is copied to \EFI\Gentoo\isolcpus\ and the isolation entry
+#   points there. Nine megabytes to make the two entries distinguishable to
+#   firmware that will not look at LoadOptions.
 #
 # SAFETY
 #   This writes EFI variables, which is a real and persistent change to the
@@ -115,7 +126,10 @@ mnt="$(mktemp -d)"
 cleanup() { mountpoint -q "$mnt" && umount "$mnt"; rmdir "$mnt" 2>/dev/null || true; }
 trap cleanup EXIT
 
-mount -o ro "$esp_dev" "$mnt" || die "could not mount ${esp_dev} read-only"
+# Mounted read-write because of the isolation copy below. This is the only
+# write this script performs, and it happens after the serial, the ESP UUID and
+# the parent-disk cross-check above have all agreed on which partition this is.
+mount "$esp_dev" "$mnt" || die "could not mount ${esp_dev}"
 
 mapfile -t images < <(find "${mnt}/EFI/Gentoo" -maxdepth 1 -name 'vmlinuz-*.efi' -printf '%f\n' 2>/dev/null | sort)
 case "${#images[@]}" in
@@ -126,6 +140,44 @@ esac
 readonly IMAGE="${images[0]}"
 readonly LOADER="\\EFI\\Gentoo\\${IMAGE}"
 printf '  %s  (%s bytes)\n' "$LOADER" "$(stat -c %s "${mnt}/EFI/Gentoo/${IMAGE}")"
+
+# ---------------------------------------------------------------------------
+# 2b. Give the isolation entry its own file, for the reason in the header.
+#
+# The copy lives in a subdirectory rather than beside the original, so the
+# maxdepth-1 ambiguity check above still sees exactly one kernel and does not
+# start refusing to run because of a file this script itself created.
+#
+# It is refreshed whenever it differs from the original, so a kernel rebuild
+# cannot leave the isolation arm measuring last week's image - a confound that
+# would be invisible in the results and attributed to isolcpus.
+# ---------------------------------------------------------------------------
+readonly ISOLCPUS_DIR="${mnt}/EFI/Gentoo/isolcpus"
+readonly ISOLCPUS_LOADER="\\EFI\\Gentoo\\isolcpus\\${IMAGE}"
+
+mkdir -p "$ISOLCPUS_DIR"
+
+# A kernel version bump changes IMAGE, and the old copy would otherwise sit
+# here forever as a bootable entry nothing points at.
+find "$ISOLCPUS_DIR" -maxdepth 1 -name 'vmlinuz-*.efi' ! -name "$IMAGE" -print -delete \
+    | sed 's|^|  removing stale copy: |'
+
+if cmp -s "${mnt}/EFI/Gentoo/${IMAGE}" "${ISOLCPUS_DIR}/${IMAGE}"; then
+    printf '  %s  (already current)\n' "$ISOLCPUS_LOADER"
+else
+    avail_kib="$(df -Pk "$mnt" | awk 'NR==2{print $4}')"
+    need_kib=$(( ( $(stat -c %s "${mnt}/EFI/Gentoo/${IMAGE}") / 1024 ) + 1024 ))
+    [ "$avail_kib" -ge "$need_kib" ] \
+        || die "ESP has ${avail_kib} KiB free, needs ${need_kib} KiB for the isolation copy"
+    cp "${mnt}/EFI/Gentoo/${IMAGE}" "${ISOLCPUS_DIR}/${IMAGE}.new"
+    mv "${ISOLCPUS_DIR}/${IMAGE}.new" "${ISOLCPUS_DIR}/${IMAGE}"
+    sync
+    # Verify the copy rather than trust cp's exit status: a short write on a
+    # full or flaky ESP produces a file that exists, boots, and panics.
+    cmp -s "${mnt}/EFI/Gentoo/${IMAGE}" "${ISOLCPUS_DIR}/${IMAGE}" \
+        || die "isolation copy does not match the original after writing it"
+    printf '  %s  (written, %s bytes)\n' "$ISOLCPUS_LOADER" "$(stat -c %s "${ISOLCPUS_DIR}/${IMAGE}")"
+fi
 
 umount "$mnt"
 
@@ -161,21 +213,23 @@ else
 fi
 
 make_entry() {
-    local label="$1" extra="$2" cmdline
+    local label="$1" loader="$2" extra="$3" cmdline
     cmdline="${BASE_CMDLINE}${extra:+ $extra}"
     efibootmgr --create \
         --disk "$target" --part "$esp_part" \
         --label "$label" \
-        --loader "$LOADER" \
+        --loader "$loader" \
         --unicode "$cmdline" >/dev/null
-    printf '  %-26s %s\n' "$label" "$cmdline"
+    printf '  %-26s %s\n' "$label" "$loader"
+    printf '  %-26s %s\n' "" "$cmdline"
 }
 
 # Same two configurations 07 creates: the plain boot used for the first boot and
 # the minimal-gentoo baseline, and the core-isolation variant measured
-# separately so its effect stays attributable.
-make_entry "Gentoo-ML" ""
-make_entry "Gentoo-ML-isolcpus" "isolcpus=2,3 nohz_full=2,3 rcu_nocbs=2,3"
+# separately so its effect stays attributable. They must point at different
+# files or the firmware keeps only the first - see the header.
+make_entry "Gentoo-ML"          "$LOADER"          ""
+make_entry "Gentoo-ML-isolcpus" "$ISOLCPUS_LOADER" "isolcpus=2,3 nohz_full=2,3 rcu_nocbs=2,3"
 
 # ---------------------------------------------------------------------------
 # 4. Append to BootOrder.
@@ -235,7 +289,10 @@ decode_hex() {
     done
 }
 
-for label in "Gentoo-ML" "Gentoo-ML-isolcpus"; do
+for spec in "Gentoo-ML|${LOADER}" "Gentoo-ML-isolcpus|${ISOLCPUS_LOADER}"; do
+    label="${spec%%|*}"
+    want_loader="${spec#*|}"
+
     # Explicit repetition instead of {4}: mawk is /usr/bin/awk on Ubuntu and
     # its support for interval expressions is not something to rely on.
     block="$(printf '%s\n' "$verbose" | awk -F'\t' -v l="$label" '
@@ -262,9 +319,12 @@ $(printf '%s\n' "$block" | sed -n 's/^ *data: //p' | decode_hex)"
         *) check bad "  points at ESP ${esp_partuuid}" ;;
     esac
 
+    # Per-entry, not shared: the whole point of the isolation copy is that the
+    # two entries name different files, so checking both against one path would
+    # pass on exactly the arrangement the firmware deletes.
     case "$haystack" in
-        *"File(${LOADER})"*) check ok "  loader ${LOADER}" ;;
-        *) check bad "  loader ${LOADER}" ;;
+        *"File(${want_loader})"*) check ok "  loader ${want_loader}" ;;
+        *) check bad "  loader ${want_loader}" ;;
     esac
 
     # The one that matters most: no root= means a panic, minutes from now, on
@@ -273,6 +333,16 @@ $(printf '%s\n' "$block" | sed -n 's/^ *data: //p' | decode_hex)"
         *"root=PARTUUID=${ROOT_PARTUUID}"*) check ok "  cmdline carries root=PARTUUID" ;;
         *) check bad "  cmdline carries root=PARTUUID" ;;
     esac
+
+    # An isolation entry without the isolation arguments boots fine and
+    # measures the plain configuration under the isolcpus label, which is the
+    # one outcome worse than not booting at all.
+    if [ "$label" = "Gentoo-ML-isolcpus" ]; then
+        case "$haystack" in
+            *"isolcpus=2,3"*) check ok "  cmdline carries isolcpus" ;;
+            *) check bad "  cmdline carries isolcpus" ;;
+        esac
+    fi
 
     case ",${final_order}," in
         *",${num},"*) check ok "  Boot${num} is in BootOrder" ;;
@@ -291,9 +361,15 @@ cat <<EOF
 
 ==> Boot entries restored.
 
-    Reboot, press F11, pick 'Gentoo-ML'. Ubuntu is still first in BootOrder,
-    so a plain reboot goes back to Ubuntu and a failed boot costs a power
-    cycle.
+    Reboot, press F11, pick 'Gentoo-ML' or 'Gentoo-ML-isolcpus'. Ubuntu is
+    still first in BootOrder, so a plain reboot goes back to Ubuntu and a
+    failed boot costs a power cycle.
+
+    Check 'cat /proc/cmdline' after logging in. CMDLINE_OVERRIDE is off, so a
+    boot through an NVRAM entry shows root=PARTUUID= twice - once from the
+    builtin command line and once from the entry's LoadOptions. Seeing it only
+    once means the firmware booted \EFI\BOOT\BOOTX64.EFI instead and no
+    per-configuration arguments were applied.
 
     If the entries disappear again after a BIOS settings change, this is the
     script to re-run; it is idempotent.

@@ -215,7 +215,26 @@ mountpoint -q /efi || die "/efi is not mounted"
 mkdir -p "$ESP_DIR"
 install -m 0644 /boot/vmlinuz "${ESP_DIR}/vmlinuz-${KVER}.efi"
 cp -f "/boot/config-${KVER}" "${ESP_DIR}/" 2>/dev/null || true
-ls -la "$ESP_DIR"
+
+# A second copy of the same image, for the isolcpus entry below to point at.
+#
+# This board deletes a boot entry whose loader path duplicates one it already
+# has, keeping the first. Observed twice on 2026-09-18: Gentoo-ML and
+# Gentoo-ML-isolcpus were created together and verified by reading NVRAM back,
+# and one POST later only Gentoo-ML was left - while UEFI OS and Gentoo-ML,
+# which name different files on this same partition, both survived. LoadOptions
+# are not part of what the firmware treats as distinct, so two entries that
+# differ only in their command line cannot coexist. Since a per-configuration
+# command line is the entire point of the second entry, it gets its own file.
+#
+# The copy goes in a subdirectory so that anything globbing vmlinuz-*.efi at the
+# top level - 12_restore_boot_entries.sh does, to discover the version without
+# hardcoding it - still finds exactly one kernel.
+mkdir -p "${ESP_DIR}/isolcpus"
+find "${ESP_DIR}/isolcpus" -maxdepth 1 -name 'vmlinuz-*.efi' ! -name "vmlinuz-${KVER}.efi" -delete
+install -m 0644 /boot/vmlinuz "${ESP_DIR}/isolcpus/vmlinuz-${KVER}.efi"
+
+ls -la "$ESP_DIR" "${ESP_DIR}/isolcpus"
 
 # ---------------------------------------------------------------------------
 # 4b. The removable-media fallback path, so the disk boots with no NVRAM entry.
@@ -355,24 +374,29 @@ if [ -n "$stale" ]; then
 fi
 
 make_entry() {
-    local label="$1" extra="$2" cmdline
+    local label="$1" loader="$2" extra="$3" cmdline
     cmdline="${BASE_CMDLINE}${extra:+ $extra}"
     efibootmgr --create \
         --disk "$esp_disk" --part "$esp_part" \
         --label "$label" \
-        --loader "\\EFI\\Gentoo\\vmlinuz-${KVER}.efi" \
+        --loader "$loader" \
         --unicode "$cmdline" >/dev/null
-    printf '  %-26s %s\n' "$label" "$cmdline"
+    printf '  %-26s %s\n' "$label" "$loader"
+    printf '  %-26s %s\n' "" "$cmdline"
 }
 
 # Plain boot. This is the one to use for the first boot and for the
 # minimal-gentoo baseline measurement.
-make_entry "Gentoo-ML" ""
+make_entry "Gentoo-ML" "\\EFI\\Gentoo\\vmlinuz-${KVER}.efi" ""
 
 # Core isolation, per the project spec. Cores 0-1 run the training loop, 2-3
 # are taken out of the general scheduler pool for the data loader and
 # checkpoint I/O. Measured separately so the effect is attributable.
-make_entry "Gentoo-ML-isolcpus" "isolcpus=2,3 nohz_full=2,3 rcu_nocbs=2,3"
+#
+# Points at the second copy installed in step 4, not at the image above: two
+# entries naming the same file do not both survive a POST on this board.
+make_entry "Gentoo-ML-isolcpus" "\\EFI\\Gentoo\\isolcpus\\vmlinuz-${KVER}.efi" \
+    "isolcpus=2,3 nohz_full=2,3 rcu_nocbs=2,3"
 
 # Put the new entries at the END of BootOrder rather than leaving them out of
 # it. efibootmgr --create prepends by default, which would make an unproven
