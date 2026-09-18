@@ -24,7 +24,7 @@ The full pipeline was last run clean on 2026-09-18 at 09:02–09:05:
 
 **It has now booted on bare metal, and the CUDA stack survived.** First on
 2026-09-18 09:12–09:27 from the F11 menu; `09_gentoo_first_boot.sh` ran to
-completion with `exit_status=0`. Four more bare-metal boots since, and the
+completion with `exit_status=0`. Five more bare-metal boots since, and the
 CUDA stack has come up on every one of them — the two runs that produced no
 measurement failed on network and on a stale checkout, never on the driver.
 The most recent bundle is in
@@ -57,9 +57,10 @@ step at **34.9%** of the bf16 tensor ceiling (34.8–35.0 across the seven).
 Compute, memory and pinned transfer are all close to the card's limits
 (92–107%); pageable H2D sits at 59.4%.
 
-The baseline comparison is now **complete**: device side and feed path, both
-operating systems, one matched stack, with repeats. What is left is the
-`isolcpus` arm — see "Do this next".
+The comparison is now **complete**: device side and feed path, both operating
+systems, one matched stack, with repeats, plus the `isolcpus` arm. Sixteen runs
+in `results/`. **This prototype is finished** — see "Where this stops" for what
+was deliberately left and why.
 
 ### What the OS was actually worth
 
@@ -157,41 +158,47 @@ this next", step 3.
 
 ---
 
-## Do this next
+## Where this stops
 
-**Boot the `isolcpus` arm and measure it.** The baseline comparison is finished
-— device side and feed path, both operating systems, matched stack, repeats —
-and every loss still on the table is host-side and structural: the training
-step at 34.9% of the bf16 ceiling, the −8% eager dispatch, and a worker sweep
-that degrades past the physical core count. Four cores feeding 3584 is this
-build's structural weak point, and core isolation is the one knob aimed at
-exactly that.
+**The prototype is finished.** Both questions it was built to answer are
+answered: the CUDA stack survives a kernel stripped to 1,459 options, and the
+share of the card this OS reaches is measured per path, with the losses
+attributed. Sixteen runs on one matched stack, in `results/`.
 
-```
-# reboot, F11, pick Gentoo-ML-isolcpus.  Then, as root:
-/root/run.sh isolcpus          # preflight + 3 runs, one command
+Nothing further is planned here. What remains is deliberately left, for
+reasons that will not change by trying again:
 
-# back on Ubuntu
-sudo ./scripts/11_collect_from_target.sh
-cp logs/from-target/results/*-isolcpus.json results/     # NOT *.json - see below
-python3 -m gpubench compare results/*minimal-gentoo*.json results/*isolcpus*.json
-python3 -m gpubench utilization results/*isolcpus*.json
-```
+- **The training step at 34.9% of the bf16 ceiling** is the largest loss left
+  and is *not* OS noise — three separate comparisons put it inside the same
+  range on both operating systems. It belongs to the workload: at batch 1 the
+  151,936-token vocabulary makes the logits tensor, not the weights, the
+  memory bottleneck. Fixing it means 8-bit AdamW, checkpointing with a larger
+  batch, or a compiled step — none of which is an operating-system question.
+- **The `isolcpus` arm is measured and closed.** Pinning the DataLoader workers
+  onto the isolated core would make the arm test what its name claims, but the
+  feed path puts the entire host cost at 2.3–2.6%, so the ceiling on that gain
+  is below the effect already measured between the two operating systems. See
+  the section below for what it did measure.
+- **The udev coldplug boot** was seen once and never again in five boots since,
+  with every disk-side explanation checked and cleared. It is a race, and
+  catching it needs the boot where it happens. `r8169` is named explicitly in
+  `/etc/conf.d/modules` so nothing depends on the answer.
+- **`headless` and `performance-governor`** have nothing left to measure
+  separately: the graphical stack is absent from the tree rather than unused,
+  and the preflight sets the governor on both sides of every comparison.
 
-Three things to get right, in this order:
+If a later session does want another arm, the machinery is intact and the
+runbook below still works. Three things to get right:
 
-1. **`Gentoo-ML-isolcpus` must come from the NVRAM entry.** The `isolcpus=2,3
-   nohz_full=2,3 rcu_nocbs=2,3` arguments live only in that entry's
-   LoadOptions. If the firmware has discarded it, the `UEFI OS` fallback still
-   boots — but it boots the *builtin* command line, i.e. without isolation, and
-   the run would silently re-measure `minimal-gentoo` under a different label.
-   Run `sudo ./scripts/12_restore_boot_entries.sh` from Ubuntu first if the
-   entry is missing from the F11 menu.
-2. **Confirm the isolation actually took**, before trusting anything. It has
-   been empty on all thirteen runs so far, because every one of them booted the
-   plain arm:
+1. **The configuration must come from the NVRAM entry.** If the firmware has
+   discarded it, the `UEFI OS` fallback still boots — but with the *builtin*
+   command line, so the run silently re-measures the plain configuration under
+   another label. `sudo ./scripts/12_restore_boot_entries.sh` puts the entries
+   back from Ubuntu; a new configuration needs its own kernel copy on the ESP,
+   for the reason in "the firmware compares loader paths" below.
+2. **Confirm the configuration actually took**, before trusting anything:
    ```
-   cat /proc/cmdline                       # isolcpus= present?
+   cat /proc/cmdline                       # root=PARTUUID= twice, and the arguments?
    python3 -m gpubench env | grep -E 'isolated|nohz_full'
    ```
 3. **Copy results back by label, never with `*.json`.**
@@ -202,9 +209,47 @@ Three things to get right, in this order:
    baseline with three releases of torch drift. That confound is the reason the
    `compare` stack check exists; do not reintroduce it through a wildcard.
 
-Expect the feed path and the dispatch number to move, and expect compute and
-memory not to. Take three runs; the Gentoo side is deterministic enough that
-three is plenty.
+---
+
+## What `isolcpus` measured
+
+Three runs on 2026-09-18 (12:29:32, 12:31:14, 12:32:54), booted from the
+`Gentoo-ML-isolcpus` entry with `isolcpus=2,3 nohz_full=2,3 rcu_nocbs=2,3`,
+verified in the environment capture as `isolated "2-3"`, `nohz_full "2-3"`.
+Compared against the seven `minimal-gentoo` runs by the same overlapping-range
+rule used everywhere else:
+
+| path | minimal-gentoo n=7 | isolcpus n=3 | verdict |
+|---|---|---|---|
+| GEMM fp32 | 9.40 .. 9.54 TFLOPS | 9.44 .. 9.52 | overlap — same |
+| GEMM bf16 | 26.97 .. 27.39 TFLOPS | 27.38 | overlap — same |
+| memory bandwidth | 333.10 GB/s | 333.10 | identical |
+| PCIe pinned / pageable | 24.58 .. 24.59 / 14.81 .. 14.92 | 24.57 .. 24.59 / 14.87 .. 14.90 | overlap — same |
+| launch eager / graphed | 3.040 .. 3.143 / 0.905 .. 0.919 µs | 3.122 .. 3.151 / 0.912 .. 0.924 | overlap — same |
+| train MFU / tok/s | 34.8 .. 35.0 % / 3870 .. 3896 | 34.9 % / 3887 | overlap — same |
+| feed efficiency | 96.10 .. 96.31 % | 96.10 .. 96.23 % | overlap — same |
+| step p99 / p50 | 1.001 .. 1.002 | 1.002 | overlap — same |
+| **feed, workers 0** | **234.1 .. 234.7 img/s** | **219.6 .. 221.2** | **−6%** |
+
+One row, and it is a regression. The topology says why:
+
+```
+CPU 0,1 = physical core 0        CPU 4,5 = physical core 2
+CPU 2,3 = physical core 1        CPU 6,7 = physical core 3
+```
+
+`isolcpus=2,3` does not isolate two threads, it removes an entire physical core
+— a quarter of this CPU — from the scheduler's pool. Nothing in the harness
+calls `sched_setaffinity`, so no thread was ever placed on the isolated core and
+the run simply executed on three cores instead of four. Every GPU-bound path was
+indifferent; the one purely host-bound path (decode inline in the main process,
+`workers=0`) paid the whole cost.
+
+**Isolation without pinning is core removal.** The spec's intent — cores 0–1
+running the training loop, 2–3 dedicated to the loader — needs the placement to
+be made explicit in `gpubench/pipeline.py` (a `worker_init_fn` setting worker
+affinity, and the main process pinned to the complement). That is the experiment
+this arm did not run.
 
 ---
 
@@ -487,6 +532,53 @@ So the division of labour is now:
 - **NVRAM entries** — select between configurations. Losing them now costs the
   `isolcpus` arm of the A/B test, not the ability to boot.
 
+### The firmware compares loader paths, not command lines
+
+A second, sharper failure of the same machinery, and the one that actually
+blocked the `isolcpus` arm for three reboots on 2026-09-18.
+
+`Gentoo-ML` and `Gentoo-ML-isolcpus` were created together, both pointing at
+`\EFI\Gentoo\vmlinuz-6.18.48-gentoo.efi` and differing only in LoadOptions, and
+both verified by reading NVRAM back. One POST later `Gentoo-ML` was there and
+`Gentoo-ML-isolcpus` was gone. Written again, deleted again. Meanwhile `UEFI OS`
+and `Gentoo-ML` — different files on that same partition — survived every time.
+
+So it is not "entries the scan cannot re-derive": one entry at a path the scan
+does not know survives indefinitely. **Two entries naming the same file do not.**
+The firmware takes the loader path as the entry's identity, keeps the first and
+drops the rest, and does not consider LoadOptions part of what makes an entry
+distinct — which is precisely backwards for an A/B menu whose two arms differ
+only in their command line.
+
+The fix is to stop sharing the file. `07` installs a second copy of the same
+image at `\EFI\Gentoo\isolcpus\vmlinuz-$KVER.efi` and `12` maintains it from
+Ubuntu, refreshing it whenever it differs from the original so a kernel rebuild
+cannot leave the isolation arm booting a stale image. The entry has survived
+every POST since, and the arm was measured on the next boot.
+
+Two details worth keeping:
+
+- The copy lives in a **subdirectory**, not beside the original. `12` discovers
+  the kernel version by globbing `vmlinuz-*.efi` at the top level of
+  `\EFI\Gentoo` rather than hardcoding it, and aborts if it finds more than one;
+  a sibling copy would make the script refuse to run over a file it created.
+- `12` now mounts the ESP **read-write** — the only write it performs, after the
+  serial, the ESP UUID and the parent-disk cross-check have all agreed on the
+  partition. It verifies the copy with `cmp` rather than trusting `cp`, because
+  a short write produces a file that exists, boots, and panics.
+
+And the check that catches the whole class of problem, since
+`CONFIG_CMDLINE_OVERRIDE` is off and the two command lines concatenate:
+
+```
+cat /proc/cmdline    # root=PARTUUID= twice -> booted through an NVRAM entry
+                     # root=PARTUUID= once  -> booted the fallback, no arguments
+```
+
+One occurrence means the run is about to measure the plain configuration under
+whatever label was passed to it. That is worse than a boot that fails, and it
+had already happened once before anyone thought to look.
+
 ---
 
 ## Machine
@@ -560,18 +652,22 @@ it establishes the mounts and syncs the scripts into the chroot.
 | `09_gentoo_first_boot.sh` | **booted Gentoo** | Verify, install torch, benchmark |
 | `10_vm_smoke_test.sh` | host | QEMU boot test, non-destructive |
 | `11_collect_from_target.sh` | host | Read `/root/handoff` off the target |
-| `12_restore_boot_entries.sh` | host | Recreate the EFI boot entries after NVRAM loss |
+| `12_restore_boot_entries.sh` | host | Recreate the EFI boot entries, and the per-configuration kernel copy they point at |
 | `13_gentoo_preflight_and_run.sh` | **booted Gentoo** | Network, checkout, governor, then N× `09` |
 | `14_install_target_runner.sh` | host | Put 13 on the target as `/root/run.sh` |
 
 01, 03 and 04 are done and do not need re-running. 02, 05–08 and 12 are
 idempotent.
 
-`14` is the only script in the project that mounts the target **read-write**
-from Ubuntu, so it checks harder than the read-only collectors do — serial,
-model, not-the-live-root, `/etc/gentoo-release` present, a repo clone present —
-and writes exactly one file. Re-run it whenever `13` changes; the copy does not
+`14` is the only script that mounts the target **root** read-write from Ubuntu,
+so it checks harder than the read-only collectors do — serial, model,
+not-the-live-root, `/etc/gentoo-release` present, a repo clone present — and
+writes exactly one file. Re-run it whenever `13` changes; the copy does not
 update by itself, which is the cost of it being the bootstrap.
+
+`12` mounts the target **ESP** read-write, for the one file described under
+"the firmware compares loader paths". Same guards, one write, verified with
+`cmp` afterwards. Every other host-side script treats the target as read-only.
 
 ---
 
@@ -600,11 +696,18 @@ command line lives in the EFI boot entry, so each configuration under test gets
 its own named entry and the firmware boot menu doubles as the A/B test menu:
 
 ```
-Boot0002  UEFI OS              \EFI\BOOT\BOOTX64.EFI  <- firmware made this one
-Boot0003  Gentoo-ML            root=PARTUUID=... rw nvidia-drm.modeset=0 console=tty0
-Boot0004  Gentoo-ML-isolcpus   + isolcpus=2,3 nohz_full=2,3 rcu_nocbs=2,3
+Boot0002  UEFI OS              \EFI\BOOT\BOOTX64.EFI            <- firmware made this one
+Boot0003  Gentoo-ML            \EFI\Gentoo\vmlinuz-*.efi
+                               root=PARTUUID=... rw nvidia-drm.modeset=0 console=tty0
+Boot0004  Gentoo-ML-isolcpus   \EFI\Gentoo\isolcpus\vmlinuz-*.efi
+                               + isolcpus=2,3 nohz_full=2,3 rcu_nocbs=2,3
 BootOrder 0001,0000,0002,0003,0004                <- 0001 is Ubuntu, still first
 ```
+
+Each configuration needs **its own copy of the kernel image**, not just its own
+entry: this firmware deletes an entry whose loader path duplicates one it
+already has, whatever the LoadOptions say. See "the firmware compares loader
+paths" above.
 
 `UEFI OS` is not ours. The firmware created it by finding
 `\EFI\BOOT\BOOTX64.EFI` during its own scan, which is exactly why it is the
@@ -763,13 +866,13 @@ exits. If a `gentoo-ml login:` is on screen, check whether
 
 ## How the bugs went, and what changed
 
-Fifteen bugs during this build. Two were real system-configuration problems
-(`root=UUID=` without an initramfs, and the missing `efi-framebuffer` fallback
-driver). The other thirteen were all script orchestration: source-versus-deployed
-copies drifting, mount preconditions, and success being announced rather than
-verified.
+Sixteen bugs during this build. Three were real system-configuration problems
+(`root=UUID=` without an initramfs, the missing `efi-framebuffer` fallback
+driver, and two boot entries sharing one loader path). The other thirteen were
+all script orchestration: source-versus-deployed copies drifting, mount
+preconditions, and success being announced rather than verified.
 
-Five patterns worth not repeating:
+Six patterns worth not repeating:
 
 - **Writing a parser against an assumed output format.** `efibootmgr` prints the
   device path after the label, so an anchored `label$` match never fired and
@@ -791,6 +894,14 @@ Five patterns worth not repeating:
   the governor. The same applies to the `cp logs/from-target/results/*.json`
   line that used to be here: it silently undid the torch-2.11 supersede, and a
   wildcard in a runbook is a bug waiting for someone to run it verbatim.
+
+- **Verifying a write is not verifying it persists.** `12` read NVRAM back and
+  confirmed both entries existed, pointed at the right ESP and carried the right
+  command line — and one of them was gone after the next POST, twice. The check
+  was correct and proved nothing about the state at boot time. Where another
+  component owns the storage, the test that counts happens on the far side of
+  whatever it is that can lose the data. Which is also why a run now checks
+  `/proc/cmdline` instead of trusting that the right entry was selected.
 
 - **Code exercised only on the clean path.** Both of 2026-09-18's bugs were
   this, and both blocked *resuming* rather than starting. 07 read

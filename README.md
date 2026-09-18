@@ -66,13 +66,19 @@ one-shot benchmark. Every run is tagged with a configuration label, and results
 are diffed across labels:
 
 ```
-stock-ubuntu → minimal-gentoo → headless → isolcpus → performance-governor
+stock-ubuntu → minimal-gentoo → isolcpus
 ```
 
+Three labels rather than the five originally planned: `headless` and
+`performance-governor` turned out to have nothing left to measure on their own,
+because the Gentoo build has no graphical stack in its tree at all and the
+preflight sets the governor on both sides of every comparison. See Status.
+
 Two "loss" data points were already visible on the stock system before any of
-this was built: the desktop session was holding 358 MiB of VRAM, and the PCIe
-link was sitting at gen 1 of 4 at idle — which is normal downshift behaviour,
-but means PCIe bandwidth must be measured under load or the number is fiction.
+this was built: the desktop session was holding 473 MiB of VRAM at the moment a
+benchmark started, and the PCIe link was sitting at gen 1 of 4 at idle — which
+is normal downshift behaviour, but means PCIe bandwidth must be measured under
+load or the number is fiction.
 
 ---
 
@@ -102,8 +108,9 @@ memory bandwidth, PCIe 4.0 x16.
 Everything below runs on one matched software stack — torch 2.14.0,
 torchvision 0.29.0, Python 3.14.7, cuDNN 92400, driver 595.84 — so the kernel
 is the only variable. `results/` holds every run: **stock-ubuntu n=6,
-minimal-gentoo n=7**, the Gentoo side spread across three separate boots. A row
-counts as a difference only when the two min..max ranges do not overlap.
+minimal-gentoo n=7, isolcpus n=3**, the Gentoo side spread across four separate
+boots. A row counts as a difference only when the two min..max ranges do not
+overlap.
 
 ### How much of the card this OS reaches
 
@@ -204,6 +211,34 @@ OS-level noise — and removing it is what this project set out to do. For a
 measurement harness it matters more than the means: a 48% swing is wide enough
 to hide every effect the later configuration arms are meant to detect.
 
+### The `isolcpus` arm changed nothing, for a reason worth keeping
+
+`isolcpus=2,3 nohz_full=2,3 rcu_nocbs=2,3`, three runs, against the seven
+`minimal-gentoo` ones. Every device-side range and every feed-path range
+overlaps: GEMM, memory, PCIe, dispatch, MFU, tokens/s, feed efficiency
+(96.10–96.23% against 96.10–96.31%), step jitter. The only row whose ranges do
+**not** overlap is a regression:
+
+```
+workers 0, decode inline in the main process
+    minimal-gentoo   234.1 .. 234.7 img/s
+    isolcpus         219.6 .. 221.2 img/s        -6%
+```
+
+The topology explains it. On this i3-14100F, logical CPUs 0–1 are physical core
+0 and 2–3 are physical core 1, so `isolcpus=2,3` removes an entire core — a
+quarter of the CPU — from the scheduler's pool. Nothing in the harness sets
+affinity, so no thread was placed on the isolated core and the run simply
+executed on three cores instead of four. The GPU-bound paths did not notice;
+the one purely host-bound path paid for it.
+
+So the finding is not that core isolation is worthless. It is that **isolation
+without pinning is just core removal**, and that testing the spec's intent would
+mean placing the DataLoader workers on the isolated core explicitly. That was
+left undone deliberately: the feed-path decomposition puts the entire host cost
+at 2.3–2.6%, so the ceiling on any such gain is smaller than the effect already
+measured between the two operating systems.
+
 ---
 
 ## Why Gentoo as the base
@@ -251,7 +286,8 @@ scripts/
   09_gentoo_first_boot.sh       verify, install torch, benchmark    (on booted Gentoo)
   10_vm_smoke_test.sh           QEMU boot test, non-destructive (snapshot=on)
   11_collect_from_target.sh     read /root/handoff off the target disk
-  12_restore_boot_entries.sh    recreate the EFI boot entries after NVRAM loss
+  12_restore_boot_entries.sh    recreate the EFI boot entries, and the
+                                per-configuration kernel copy they point at
   13_gentoo_preflight_and_run.sh  the whole Gentoo session in one command
                                   (on booted Gentoo; also at /root/run.sh)
   14_install_target_runner.sh   put 13 on the target as /root/run.sh
@@ -344,24 +380,32 @@ cable comes out and nothing else on the machine has changed.
       dispatch regression turns out to be the wrong size to matter under load.
       Took three attempts to collect — see `HANDOFF.md` for why the first two
       measured nothing, and what `13_gentoo_preflight_and_run.sh` now handles
-- [ ] **Explain why that boot's udev coldplug loaded no modules** — `r8169` and
-      `nvidia_drm`, the two modules nothing names explicitly, were both absent,
-      while the two named in `/etc/conf.d/modules` loaded fine. Every disk-side
-      explanation was checked and cleared (alias, deps, firmware, blacklists,
-      rules, `USE=kmod`). **Every boot since has been fine on the same disk and
-      kernel** — seen once, then not on the three boots after it — so it is a
-      race rather than a misconfiguration, and catching it means being on the
-      boot where it happens. `13` captures `udevadm test` automatically on a
-      boot that fails. `r8169` is now named explicitly in `/etc/conf.d/modules`,
-      which removes the dependency on the answer without being one
-- [ ] **`isolcpus` arm** — the next configuration to measure. The remaining
-      losses are both host-side and structural (four cores feeding 3584): the
-      training step at 34.9%, the −8% eager dispatch, and a worker sweep that
-      degrades past the physical core count. Core isolation is the one knob
-      aimed at exactly that
-- [ ] Raise the training step off **34.9%** of the bf16 ceiling — the weakest
-      path by a wide margin, and now known not to be OS noise
-- [ ] `headless` and `performance-governor` arms after `isolcpus`
+- [x] **`isolcpus` arm measured** — three runs, every range overlapping the
+      baseline except a −6% regression on the one host-bound path. Isolation
+      without pinning removes a core rather than dedicating one; see above
+- [x] **Boot entries survive this board** — the firmware compares loader paths,
+      not command lines, so the isolation entry now boots its own copy of the
+      kernel from `\EFI\Gentoo\isolcpus\`. See below
+
+That closes the prototype. What is left over is either outside what an OS can
+answer or not reproducible on demand:
+
+- **The training step at 34.9% of the bf16 ceiling** is the largest remaining
+  loss and is **not** OS noise — the OS comparison came back identical on it
+  three times over. It belongs to the workload: a 151,936-token vocabulary
+  makes the logits tensor, not the weights, the memory bottleneck at batch 1.
+  That is the next prototype's problem, not this one's
+- **The one boot whose udev coldplug loaded no modules** was seen once and
+  never again across the five boots after it, on the same disk and kernel.
+  Every disk-side explanation was checked and cleared (alias, deps, firmware,
+  blacklists, rules, `USE=kmod`), so it is a race, and catching it means being
+  on the boot where it happens. `r8169` is now named explicitly in
+  `/etc/conf.d/modules`, which removes the dependency on the answer without
+  being one, and `13` captures `udevadm test` automatically on a boot that fails
+- **`headless` and `performance-governor` arms** have nothing left to measure
+  separately. The graphical stack is absent from the Gentoo tree entirely rather
+  than merely unused, and the governor is set to `performance` by the preflight
+  on both sides of every comparison already
 
 ### The firmware does not keep boot entries it did not create
 
@@ -391,6 +435,37 @@ is the one thing only LoadOptions can express, and the firmware boot menu
 doubling as the A/B test menu is worth keeping. But losing them now costs the
 `isolcpus` arm of a comparison rather than the ability to boot at all.
 
+### And it compares boot entries by loader path, not by command line
+
+The A/B menu above then failed in a second, sharper way, which took three
+reboots on 2026-09-18 to pin down. `Gentoo-ML` and `Gentoo-ML-isolcpus` were
+written together and verified by reading NVRAM back; one POST later only
+`Gentoo-ML` was left. Written again, deleted again — while `UEFI OS` and
+`Gentoo-ML`, which name *different* files on that same partition, both survived
+every time.
+
+Two entries differing only in their LoadOptions cannot coexist on this board:
+the firmware treats the loader path as the entry's identity, keeps the first,
+and drops the rest. Since a per-configuration command line is the entire point
+of the second entry, the fix is to make the two entries name different files —
+`07` and `12` now install a second copy of the same kernel image at
+`\EFI\Gentoo\isolcpus\` and point the isolation entry there. Nine megabytes to
+be distinguishable to firmware that will not look at LoadOptions. The entry has
+survived every POST since.
+
+This also gives a one-line check that the intended configuration actually
+booted. `CONFIG_CMDLINE_OVERRIDE` is off, so the builtin command line and the
+entry's LoadOptions are concatenated:
+
+```
+cat /proc/cmdline    # root=PARTUUID= twice -> booted through an NVRAM entry
+                     # root=PARTUUID= once  -> booted \EFI\BOOT\BOOTX64.EFI,
+                     #                         no per-configuration arguments
+```
+
+A run that skips that check can silently measure the plain configuration under
+another label, which is worse than a boot that fails.
+
 See [`HANDOFF.md`](HANDOFF.md) for the current state, the exact next steps, and
 the reasoning behind the decisions that are settled.
 
@@ -404,7 +479,7 @@ fixing before any of them get blamed on something else:
 | `scaling_governor = powersave` | the 4 cores feeding the GPU are not free to boost |
 | `persistence_mode = Disabled` | the driver unloads between processes; clocks drop with it |
 | `transparent_hugepage = madvise` | project spec calls for THP off with explicit hugepages |
-| 358 MiB VRAM held by the desktop session | gone once the target boots headless |
+| 473 MiB VRAM held by the desktop session | gone once the target boots headless |
 
 Three of the four are now confirmed recovered: Gentoo runs start with 11,776
 MiB of VRAM free against Ubuntu's 11,461–11,603, persistence mode is enabled,
