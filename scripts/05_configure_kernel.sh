@@ -445,9 +445,36 @@ fi
 say "Installing kernel to /boot"
 make -s install
 
+# `make install` does not reliably leave the config beside the image. Whether
+# /boot/config-$kver appears depends on which installkernel is in $PATH, and on
+# this system there is none - the kernel's own arch/x86/boot/install.sh runs
+# instead, which writes /boot/vmlinuz, rotates the previous one to
+# /boot/vmlinuz.old, and copies no config at all.
+#
+# That absence is not cosmetic. 07 reads /boot/config-$kver to decide whether
+# installing \EFI\BOOT\BOOTX64.EFI is safe, because a fallback boot on a kernel
+# without CONFIG_CMDLINE panics with no root= - and it panics only once NVRAM is
+# already gone, which is the one moment there is no other way in. A missing file
+# is indistinguishable from a kernel built without the option, so 07 correctly
+# refuses. It refused on 2026-09-18 for exactly this reason, on a kernel that
+# did have the option.
+#
+# Write the record explicitly, and prove it says what the build actually did.
+say "Recording the build config at /boot/config-${kver}"
+install -m 0644 .config "/boot/config-${kver}"
+
+[ -f "/boot/config-${kver}" ] \
+    || die "/boot/config-${kver} was not written - 07 will refuse to install the fallback boot path"
+grep -q '^CONFIG_CMDLINE_BOOL=y' "/boot/config-${kver}" \
+    || die "/boot/config-${kver} does not record CONFIG_CMDLINE_BOOL=y - it is out of step with the .config just built"
+grep -q "^CONFIG_CMDLINE=\"${BUILTIN_CMDLINE}\"$" "/boot/config-${kver}" \
+    || die "/boot/config-${kver} does not record the expected CONFIG_CMDLINE - it is out of step with the .config just built"
+echo "  records CONFIG_CMDLINE, so 07 can verify the fallback boot path"
+
 say "Kernel build complete."
 echo
-echo "Image:   $(ls -la /boot/vmlinuz* 2>/dev/null | tail -1)"
+echo "Image:   $(ls -la /boot/vmlinuz 2>/dev/null)"
+echo "Config:  $(ls -la "/boot/config-${kver}" 2>/dev/null)"
 echo "Modules: $(find /lib/modules -maxdepth 1 -type d -name '*gentoo*' | tail -1)"
 echo
 echo "Config size comparison:"

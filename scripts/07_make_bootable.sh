@@ -243,24 +243,39 @@ say "Installing the removable-media fallback (\\EFI\\BOOT\\BOOTX64.EFI)"
 
 # Refuse to install a fallback that cannot boot. Without CONFIG_CMDLINE this
 # path panics, and it panics only when NVRAM is already gone - the one moment
-# there is no other way in. A missing /boot/config means 05 was run by some
-# other route; treat not-provable as not-safe.
-if [ -f "/boot/config-${KVER}" ] && grep -q '^CONFIG_CMDLINE_BOOL=y' "/boot/config-${KVER}"; then
-    builtin_cmdline="$(sed -n 's/^CONFIG_CMDLINE="\(.*\)"$/\1/p' "/boot/config-${KVER}")"
-    case "$builtin_cmdline" in
-        *root=PARTUUID=*)
-            mkdir -p /efi/EFI/BOOT
-            install -m 0644 /boot/vmlinuz /efi/EFI/BOOT/BOOTX64.EFI
-            echo "  installed, boots with the builtin command line:"
-            echo "    ${builtin_cmdline}"
-            ;;
-        *)
-            die "the kernel has CONFIG_CMDLINE_BOOL=y but no root=PARTUUID= in CONFIG_CMDLINE; a fallback boot would panic - re-run 05"
-            ;;
-    esac
-else
-    die "the kernel has no builtin CONFIG_CMDLINE; a \\EFI\\BOOT\\BOOTX64.EFI boot would panic with no root= - re-run 05 to compile one in"
+# there is no other way in. So treat not-provable as not-safe.
+#
+# The evidence is /boot/config-$KVER, which 05 writes explicitly after
+# `make install`. It has to be explicit: whether `make install` leaves a config
+# beside the image depends on which installkernel is in $PATH, and with none
+# present the kernel's own install.sh copies no config at all. Distinguish that
+# missing record from a kernel genuinely built without the option - on
+# 2026-09-18 the two were conflated and the error sent the next run back to 05,
+# which had already done its job correctly.
+if [ ! -f "/boot/config-${KVER}" ]; then
+    die "no /boot/config-${KVER}, so the builtin command line cannot be verified.
+    The kernel may well have one - this is a missing record, not a missing
+    option. 05 writes this file explicitly after 'make install'; if 05 ran from
+    an older copy of the script, re-run it. Check with:
+      grep CONFIG_CMDLINE /usr/src/linux/.config"
 fi
+
+if ! grep -q '^CONFIG_CMDLINE_BOOL=y' "/boot/config-${KVER}"; then
+    die "the kernel was built without CONFIG_CMDLINE_BOOL; a \\EFI\\BOOT\\BOOTX64.EFI boot would panic with no root= - re-run 05 to compile one in"
+fi
+
+builtin_cmdline="$(sed -n 's/^CONFIG_CMDLINE="\(.*\)"$/\1/p' "/boot/config-${KVER}")"
+case "$builtin_cmdline" in
+    *root=PARTUUID=*)
+        mkdir -p /efi/EFI/BOOT
+        install -m 0644 /boot/vmlinuz /efi/EFI/BOOT/BOOTX64.EFI
+        echo "  installed, boots with the builtin command line:"
+        echo "    ${builtin_cmdline}"
+        ;;
+    *)
+        die "the kernel has CONFIG_CMDLINE_BOOL=y but no root=PARTUUID= in CONFIG_CMDLINE; a fallback boot would panic - re-run 05"
+        ;;
+esac
 
 # ---------------------------------------------------------------------------
 # 5. Firmware boot entries.
