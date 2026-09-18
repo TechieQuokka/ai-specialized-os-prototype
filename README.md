@@ -138,6 +138,8 @@ scripts/
   10_vm_smoke_test.sh           QEMU boot test, non-destructive (snapshot=on)
   11_collect_from_target.sh     read /root/handoff off the target disk
   12_restore_boot_entries.sh    recreate the EFI boot entries after NVRAM loss
+  13_gentoo_preflight_and_run.sh  the whole Gentoo session in one command
+                                  (on booted Gentoo; also at /root/run.sh)
 
 gpubench/                       the measurement harness
   spec.py                       the hardware ceilings, importable without torch
@@ -224,7 +226,17 @@ cable comes out and nothing else on the machine has changed.
       pipeline (transfer −2.5%, host −2.8%), reproducible to ±0.05 pp over 3 runs
 - [ ] Take the feed path on Gentoo — no Gentoo run has it yet; the two known
       kernel differences (PCIe +38/+73%, dispatch −9%) both live on that
-      boundary, so this is where they cancel or compound
+      boundary, so this is where they cancel or compound.
+      **Attempted 2026-09-18 10:52 and produced nothing**, for two independent
+      reasons: the machine booted with no network interface at all, and the
+      Gentoo checkout was three commits behind the `--feed-path` commit. Both
+      are now handled by `13_gentoo_preflight_and_run.sh`; see `HANDOFF.md`
+- [ ] **Explain why that boot's udev coldplug loaded no modules** — `r8169` and
+      `nvidia_drm`, the two modules nothing names explicitly, were both absent,
+      while the two named in `/etc/conf.d/modules` loaded fine. Every disk-side
+      explanation was checked and cleared (alias, deps, firmware, blacklists,
+      rules, `USE=kmod`), so the answer needs a live boot. `r8169` is now named
+      explicitly, which removes the dependency on the answer without being one
 - [ ] Raise the training step off **34.9%** of the bf16 ceiling — the weakest
       path by a wide margin, and now known not to be OS noise
 - [ ] `isolcpus` arm — `headless` and `performance-governor` after it
