@@ -22,11 +22,70 @@ The full pipeline was last run clean on 2026-09-18 at 09:02–09:05:
 10  boots to a login prompt on serial
 ```
 
-**Nothing has been booted on bare metal yet.** That is the next action, and it
-is the only way to answer the question the whole prototype exists for:
+**It has now booted on bare metal, and the CUDA stack survived.** Booted
+2026-09-18 09:12–09:27 from the F11 menu; `09_gentoo_first_boot.sh` ran to
+completion with `exit_status=0`. The bundle is in `logs/from-target/`.
+
+```
+nvidia-smi          WORKED - driver 595.84, CUDA 13.2, RTX 3060 seen
+modules loaded      nvidia, nvidia_uvm, nvidia_modeset, nvidia_drm  (+ r8169)
+persistence_mode    Enabled   (the VM's nvidia-persistenced failure was the absent GPU)
+dmesg               clean - mei_me and rdinit are both expected and harmless
+```
+
+So the yes/no question the prototype was built to answer is answered:
 
 > Does the CUDA stack survive a kernel stripped from Ubuntu's 10,048 enabled
-> options down to 1,459?
+> options down to 1,459?  **Yes.**
+
+That makes the remaining question the interesting one, and it is not a
+yes/no: **how much of the GPU can this OS actually reach?** Percentages of
+ceiling, not deltas against Ubuntu — a run that is 0.7% faster than Ubuntu is
+still leaving two thirds of the card unused if its MFU is 34%. Use:
+
+```
+python3 -m gpubench utilization results/*minimal-gentoo*.json
+```
+
+As measured on 2026-09-18, the weakest path is the training step at **34.8%**
+of the bf16 tensor ceiling. Compute, memory and pinned transfer are all close
+to the card's limits (92–106%); pageable H2D sits at 59.6%.
+
+### What the OS was actually worth
+
+Measured the same day on a matched stack — torch 2.14.0, Python 3.14.7,
+cuDNN 92400 on **both** sides — with Ubuntu repeated three times to establish
+a noise band. `results/` holds all four runs.
+
+| path | ubuntu n=3 (min..max) | gentoo n=1 | verdict |
+|---|---|---|---|
+| GEMM fp32 | 9.33 .. 9.54 TFLOPS | 9.40 | same |
+| GEMM bf16 | 27.03 .. 27.49 TFLOPS | 26.97 | same (−0.2%) |
+| memory bandwidth | 331.9 .. 333.1 GB/s | 333.1 | same |
+| train MFU | 34.80 .. 35.00 % | 34.80 | same |
+| train tok/s | 3872 .. 3893 | 3870 | same (−0.06%) |
+| **PCIe pageable H2D** | 8.10 .. 8.89 GB/s | **14.90** | **+68%, outside the band** |
+| PCIe pinned H2D | 15.56 .. 20.30 GB/s | 24.58 | +21%, but see below |
+| **kernel launch (eager)** | 2.79 .. 2.85 µs | **3.05** | **+7% slower** |
+
+So the minimal kernel costs nothing on compute, memory or training throughput,
+wins large on pageable host-to-device transfer, and loses a little on kernel
+dispatch. CUDA graph capture cuts the dispatch cost to 0.92 µs (3.3x), so the
+launch regression is a structural weak point rather than a real ceiling.
+
+**Two of these are not yet confirmed, because Gentoo has only one sample.**
+Ubuntu's pinned-PCIe figure swings ±13% run to run (15.56 .. 20.30), so the
++21% cannot be trusted until Gentoo is repeated. The pageable +68% is far
+enough outside a tight band (±5%) to survive almost any plausible Gentoo
+variance. Run `09_gentoo_first_boot.sh` three times on the next boot to settle
+both; the torch pin now keeps the stack fixed automatically.
+
+An earlier comparison, made before the pin existed, reported GEMM regressions
+of −1.3% to −2.8% and a +59% pageable gain. The regressions were the torch
+version, not the kernel, and vanished once the stacks matched — one of them
+(fp32) even changed sign. That run is kept at
+`results/superseded/20260917T171657-stock-ubuntu-torch2.11.json`, out of the
+`results/*stock-ubuntu*.json` glob so it cannot be picked up by accident.
 
 One trap worth naming, because it has already caused a false alarm: step 10
 boots the installation **in QEMU**, with `snapshot=on` so the real disk is never
@@ -39,6 +98,48 @@ the machine has booted.
 ---
 
 ## Do this next
+
+**Boot Gentoo and take three runs, not one.** Everything on the Gentoo side is
+a single sample, which is why two findings in the table above are still marked
+unconfirmed. Ubuntu already has its three (`results/`, 2026-09-18 09:46–09:48).
+
+```
+# on Gentoo, after booting
+for i in 1 2 3; do ./scripts/09_gentoo_first_boot.sh; done
+# back on Ubuntu
+sudo ./scripts/11_collect_from_target.sh
+cp logs/from-target/results/*.json results/
+python3 -m gpubench compare results/*stock-ubuntu*.json results/*minimal-gentoo*.json
+```
+
+The script pins torch itself now, so the stack stays fixed without thinking
+about it. It also replaces a mismatched torch if it finds one.
+
+Then the open question is the one in "Where things stand": raising the 34.8%
+training MFU. The `isolcpus` arm exists to test exactly that and has never been
+booted — and the +7% kernel-launch regression is a reason to expect it might
+help, since dispatch is exactly what core isolation protects.
+
+### Reading the comparison
+
+`compare` prints a loud `!! SOFTWARE STACK DIFFERS` block whenever torch,
+cuDNN, CUDA runtime, Python or the driver differ between two runs. If that
+block is absent, the deltas are the OS speaking. If it is present, they are
+not — no matter how clean the table above it looks. This exists because the
+first comparison had no such check and reported three torch releases of drift
+as though it were kernel tuning.
+
+The percentages that matter to this project are in `gpubench utilization`,
+not in the delta table: a configuration 0.7% faster than Ubuntu is still
+leaving two thirds of the card unused if its MFU is 34%.
+
+**Environment for the Ubuntu side**: `~/miniconda3/envs/gpubench-314`
+(Python 3.14.7 + torch 2.14.0), built to match Gentoo exactly. The older
+`envs/torch` is Python 3.11 / torch 2.11 and must not be used for baselines.
+
+---
+
+## Booting into Gentoo again
 
 1. Reboot, press **F11**, pick **`Gentoo-ML`**.
    Ubuntu is still the default boot target, so a plain reboot goes back to
@@ -60,9 +161,10 @@ the machine has booted.
    git clone https://github.com/TechieQuokka/ai-specialized-os-prototype
    cd ai-specialized-os-prototype && ./scripts/09_gentoo_first_boot.sh
    ```
-   It verifies the boot, installs torch, runs the benchmark, and compares
-   against the stock baseline. It writes `/root/handoff/` from an EXIT trap, so
-   diagnostics survive even if it aborts early.
+   It verifies the boot, installs the **pinned** torch (replacing a mismatched
+   one if it finds it), runs the benchmark, and compares against the stock
+   baseline. It writes `/root/handoff/` from an EXIT trap, so diagnostics
+   survive even if it aborts early.
 4. Reboot back to Ubuntu (no F11).
 5. ```
    sudo ./scripts/11_collect_from_target.sh

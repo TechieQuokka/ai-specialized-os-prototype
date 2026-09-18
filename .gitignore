@@ -21,7 +21,10 @@ venv/
 .vscode/
 
 # Benchmark results are deliberately NOT ignored: comparing runs across OS
-# configurations is the point of this repository.
+# configurations is the point of this repository. A run collected off the
+# target therefore has to be copied out of logs/from-target/ into results/,
+# which is ignored below - the diagnostics in that bundle (dmesg, lspci) are
+# bulky and machine-specific, but the result JSON is the deliverable.
 
 # QEMU smoke-test scratch (kernel image copy, overlay files)
 .vmtest/

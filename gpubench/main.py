@@ -177,7 +177,96 @@ def _summarize(r: dict[str, Any]) -> None:
         print("\nThrottling observed: " + ", ".join(throttled))
     else:
         print("\nNo throttling observed.")
+
+    # Last, because it is the conclusion the rest of the output supports.
+    _print_utilization(r)
     print()
+
+
+# --------------------------------------------------------------------------
+# How much of the card is actually reachable.
+#
+# This is the question the prototype exists to answer, so it gets its own view
+# rather than being inferred from a column of deltas. A delta says "this OS is
+# 0.7% faster than that one"; it cannot say whether either one is leaving a
+# third of the GPU on the floor. Every ceiling here is already measured by
+# `benches` - the numbers below are read back out of the result file, not
+# recomputed, so this works on a collected result on a host with no CUDA.
+# --------------------------------------------------------------------------
+
+def _utilization(r: dict[str, Any]) -> list[dict[str, Any]]:
+    """Achieved-against-ceiling for every path that has a meaningful ceiling."""
+    from .spec import PCIE4_X16_PRACTICAL_GBS, RTX3060_SPEC, compute_ceiling
+
+    b = r.get("benchmarks", {})
+    rows: list[dict[str, Any]] = []
+
+    def add(path: str, achieved: float | None, unit: str, ceiling: float,
+            pct: float | None, note: str = "") -> None:
+        if achieved is None:
+            return
+        # Prefer the percentage the run recorded; fall back to deriving it so a
+        # result file written before a given field existed still renders.
+        if pct is None:
+            pct = round(100.0 * achieved / ceiling, 1) if ceiling else None
+        rows.append({"path": path, "achieved": achieved, "unit": unit,
+                     "ceiling": ceiling, "pct": pct, "note": note})
+
+    gemm = b.get("peak_gemm", {})
+    if "error" not in gemm:
+        for dtype in ("fp32", "tf32", "bf16", "fp16"):
+            e = gemm.get(dtype)
+            if e:
+                add(f"compute  {dtype}", e.get("best_tflops"), "TFLOPS",
+                    compute_ceiling(dtype), e.get("pct_of_spec"))
+
+    mem = b.get("memory_bandwidth", {})
+    add("memory   device", mem.get("bandwidth_gbs"), "GB/s",
+        RTX3060_SPEC["memory_bandwidth_gbs"], mem.get("pct_of_spec"))
+
+    p = b.get("pcie", {})
+    for kind in ("pinned", "pageable"):
+        add(f"transfer h2d {kind}", p.get(f"{kind}_peak_h2d_gbs"), "GB/s",
+            PCIE4_X16_PRACTICAL_GBS, p.get(f"{kind}_pct_of_pcie4x16"))
+
+    ts = b.get("train_step", {})
+    if "mfu_pct" in ts:
+        add(f"training {ts.get('dtype', '?')} step", ts.get("achieved_tflops"), "TFLOPS",
+            compute_ceiling(ts.get("dtype", "bf16")), ts.get("mfu_pct"),
+            note="model FLOPs utilisation")
+
+    return rows
+
+
+def _print_utilization(r: dict[str, Any]) -> None:
+    rows = _utilization(r)
+    if not rows:
+        return
+
+    print("\n" + "=" * 72)
+    print(f"GPU REACH  [{r['label']}]   how much of the card this OS can actually use")
+    print("=" * 72)
+    print(f"{'path':<22}{'achieved':>14}{'ceiling':>14}{'reached':>10}")
+    print("-" * 72)
+    for row in rows:
+        pct = row["pct"]
+        pct_s = f"{pct:.1f}%" if pct is not None else "n/a"
+        achieved = f"{row['achieved']:.2f} {row['unit']}"
+        ceiling = f"{row['ceiling']:.2f} {row['unit']}"
+        line = f"{row['path']:<22}{achieved:>14}{ceiling:>14}{pct_s:>10}"
+        if row["note"]:
+            line += f"   {row['note']}"
+        print(line)
+
+    # A card is only as usable as the path a real workload is bottlenecked on,
+    # so name the worst one rather than leaving it to be spotted in the table.
+    scored = [row for row in rows if row["pct"] is not None]
+    if scored:
+        worst = min(scored, key=lambda row: row["pct"])
+        print(f"\n  Weakest path: {worst['path'].strip()} at {worst['pct']:.1f}% of ceiling")
+        over = [row for row in scored if row["pct"] > 100.0]
+        if over:
+            print("  Above 100% means the card boosted past its reference clock, not an error.")
 
 
 def _extract(r: dict[str, Any]) -> dict[str, float]:
@@ -189,12 +278,20 @@ def _extract(r: dict[str, Any]) -> dict[str, float]:
         e = b.get("peak_gemm", {}).get(dtype)
         if e:
             flat[f"gemm.{dtype}.tflops"] = e["best_tflops"]
+            # The share of the card reached matters more to this project than
+            # the absolute number, so it is diffed too.
+            if e.get("pct_of_spec") is not None:
+                flat[f"gemm.{dtype}.pct_of_spec"] = e["pct_of_spec"]
 
-    if "bandwidth_gbs" in b.get("memory_bandwidth", {}):
-        flat["memory.gbs"] = b["memory_bandwidth"]["bandwidth_gbs"]
+    mem = b.get("memory_bandwidth", {})
+    if "bandwidth_gbs" in mem:
+        flat["memory.gbs"] = mem["bandwidth_gbs"]
+        if mem.get("pct_of_spec") is not None:
+            flat["memory.pct_of_spec"] = mem["pct_of_spec"]
 
     p = b.get("pcie", {})
-    for k in ("pinned_peak_h2d_gbs", "pageable_peak_h2d_gbs"):
+    for k in ("pinned_peak_h2d_gbs", "pageable_peak_h2d_gbs",
+              "pinned_pct_of_pcie4x16", "pageable_pct_of_pcie4x16"):
         if k in p:
             flat[f"pcie.{k}"] = p[k]
 
@@ -255,6 +352,72 @@ def cmd_compare(args: argparse.Namespace) -> int:
             diffs.append(f"distro {ba['os']['distro']} -> {bb['os']['distro']}")
         if diffs:
             print("\nConfiguration differences: " + "; ".join(diffs))
+
+        _warn_stack_drift(base_label, ba, label, bb)
+    print()
+    return 0
+
+
+# The OS is the variable under test. Everything below is supposed to be held
+# fixed, so a difference here is not context for the numbers - it invalidates
+# them. This exists because it once did: the 2026-09-18 comparison ran torch
+# 2.14.0 against a 2.11.0 baseline and reported a 59% PCIe gain that could
+# just as easily have been the torch upgrade. Nothing in the output said so.
+_STACK_FIELDS = (
+    ("torch", ("torch", "torch"), "torch"),
+    ("cuda runtime", ("torch", "cuda_runtime"), "CUDA runtime"),
+    ("cudnn", ("torch", "cudnn"), "cuDNN"),
+    ("python", ("python",), "Python"),
+    ("driver", ("gpu", "driver_version"), "NVIDIA driver"),
+)
+
+
+def _dig(env_snapshot: dict[str, Any], path: tuple[str, ...]) -> Any:
+    node: Any = env_snapshot
+    for key in path:
+        if not isinstance(node, dict):
+            return None
+        node = node.get(key)
+    return node
+
+
+def _warn_stack_drift(
+    base_label: str, base_env: dict[str, Any], label: str, env_snapshot: dict[str, Any]
+) -> list[str]:
+    """Report software-stack differences between two runs being compared.
+
+    Returns the list of drifted field names so callers can test this without
+    parsing stdout.
+    """
+    drifted: list[str] = []
+    lines: list[str] = []
+    for _, path, pretty in _STACK_FIELDS:
+        a, b = _dig(base_env, path), _dig(env_snapshot, path)
+        if a == b or (a is None and b is None):
+            continue
+        drifted.append(pretty)
+        lines.append(f"  {pretty:<14} {a}  ->  {b}")
+
+    if not drifted:
+        return []
+
+    print(
+        "\n!! SOFTWARE STACK DIFFERS - the deltas above are not attributable to the OS."
+        f"\n   {base_label} and {label} did not run the same code:"
+    )
+    print("\n".join(lines))
+    print(
+        "   Re-take one side so both match, then compare again. The pin lives in\n"
+        "   scripts/09_gentoo_first_boot.sh (TORCH_VERSION)."
+    )
+    return drifted
+
+
+def cmd_utilization(args: argparse.Namespace) -> int:
+    for path in args.files:
+        data = json.loads(Path(path).read_text())
+        data.setdefault("label", Path(path).stem)
+        _print_utilization(data)
     print()
     return 0
 
@@ -285,6 +448,11 @@ def main(argv: list[str] | None = None) -> int:
     c = sub.add_parser("compare", help="diff two or more result files")
     c.add_argument("files", nargs="+")
     c.set_defaults(func=cmd_compare)
+
+    u = sub.add_parser("utilization",
+                       help="how much of the GPU each result file actually reached")
+    u.add_argument("files", nargs="+")
+    u.set_defaults(func=cmd_utilization)
 
     e = sub.add_parser("env", help="print the environment snapshot and exit")
     e.set_defaults(func=lambda a: (print(json.dumps(env.capture(), indent=2)), 0)[1])

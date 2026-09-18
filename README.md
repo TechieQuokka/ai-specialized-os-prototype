@@ -117,8 +117,23 @@ scripts/
   12_restore_boot_entries.sh    recreate the EFI boot entries after NVRAM loss
 
 gpubench/                       the measurement harness
+  spec.py                       the hardware ceilings, importable without torch
 results/                        labelled benchmark runs, diffed across configurations
 ```
+
+The harness answers the fraction-of-peak question directly:
+
+```
+python3 -m gpubench utilization results/*.json    # achieved vs ceiling, per path
+python3 -m gpubench compare  a.json b.json        # what a config change was worth
+```
+
+`utilization` needs only the result file, not a CUDA stack, so a run collected
+off the target can be read back on any machine. `compare` refuses to be quiet
+about confounds: if two runs differ in torch, cuDNN, CUDA runtime, Python or
+driver version, it prints a `!! SOFTWARE STACK DIFFERS` block, because a delta
+across an unpinned dependency is not a measurement of the OS. The torch version
+is pinned in `scripts/09_gentoo_first_boot.sh` for that reason.
 
 `00_run_pipeline.sh --from <step>` resumes after a failure, and stops at the
 first failing step with the mounts left in place so the chroot can be inspected.
@@ -167,8 +182,18 @@ cable comes out and nothing else on the machine has changed.
 - [x] NVIDIA 595.84 built against it; all five modules present
 - [x] Bootable — EFI stub, no bootloader, no initramfs; QEMU smoke test reaches a login prompt
 - [x] Boot path survives NVRAM loss — see below; the firmware erased the entries three times
-- [ ] **First bare-metal boot** — does CUDA survive the stripped kernel?
-- [ ] `minimal-gentoo` measurement and the comparison
+- [x] **First bare-metal boot** — 2026-09-18; **CUDA survives the stripped kernel**
+      (`nvidia-smi` works, all four modules loaded, `exit_status=0`)
+- [x] `minimal-gentoo` measurement captured (`results/`)
+- [x] **Valid comparison on a matched stack** — torch 2.14.0 / Python 3.14.7 /
+      cuDNN 92400 on both sides, Ubuntu repeated 3x for a noise band.
+      Compute, memory and training throughput are **unchanged** by the stripped
+      kernel; pageable H2D transfer is **+68%**; kernel launch is **+7% slower**
+- [ ] Repeat the Gentoo side 3x — it has one sample, so the pinned-PCIe (+21%)
+      and launch (+7%) findings are not yet confirmed
+- [ ] Raise the training step off **34.8%** of the bf16 ceiling — the weakest
+      path, and the reason the `isolcpus` arm exists
+- [ ] `headless`, `isolcpus`, `performance-governor` arms — none booted yet
 
 ### The firmware does not keep boot entries it did not create
 

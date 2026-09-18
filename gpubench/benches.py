@@ -21,23 +21,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# Vendor figures for the RTX 3060 12 GB (GA106), recorded as reference points
-# rather than treated as truth. `peak_gemm` also derives an FP32 ceiling from
-# the clock actually observed during the run, which is the honest comparison:
-# a card sitting at its power limit has a lower real ceiling than the spec
-# sheet claims.
-RTX3060_SPEC = {
-    "fp32_tflops": 12.74,
-    "tensor_dense_tflops": 25.5,
-    "memory_bandwidth_gbs": 360.0,
-    "cuda_cores": 3584,
-    "pcie_gen": 4,
-    "pcie_width": 16,
-}
-
-# PCIe 4.0 x16 raw is ~31.5 GB/s each way; protocol overhead puts the
-# achievable ceiling nearer 25 GB/s.
-PCIE4_X16_PRACTICAL_GBS = 25.0
+# Vendor figures for the RTX 3060 12 GB (GA106). These live in `spec` so that
+# reading a result file back does not require a torch import; see that module
+# for why they are reference points rather than truth.
+from .spec import PCIE4_X16_PRACTICAL_GBS, RTX3060_SPEC, compute_ceiling
 
 
 def _time_cuda(fn: Callable[[], None], iters: int, warmup: int = 5) -> float:
@@ -115,7 +102,7 @@ def peak_gemm(sizes: tuple[int, ...] = (1024, 2048, 4096, 8192), iters: int = 20
     # much the tensor-core dtypes actually bought over plain fp32.
     fp32_best = results.get("fp32", {}).get("best_tflops", 0.0)
     for label, entry in results.items():
-        spec = RTX3060_SPEC["fp32_tflops"] if label == "fp32" else RTX3060_SPEC["tensor_dense_tflops"]
+        spec = compute_ceiling(label)
         entry["pct_of_spec"] = round(100.0 * entry["best_tflops"] / spec, 1) if spec else None
         entry["speedup_vs_fp32"] = (
             round(entry["best_tflops"] / fp32_best, 2) if fp32_best else None
@@ -490,9 +477,7 @@ def train_step(
     flops_per_token = 6 * n_non_embed + 6 * cfg["n_layers"] * cfg["d_model"] * seq_len
     achieved_tflops = flops_per_token * tokens / secs / 1e12
 
-    ceiling = (
-        RTX3060_SPEC["fp32_tflops"] if dtype == "fp32" else RTX3060_SPEC["tensor_dense_tflops"]
-    )
+    ceiling = compute_ceiling(dtype)
 
     # Split measured peak VRAM into the part that is fixed by the model and the
     # part that scales with batch and sequence length. Only the second one can

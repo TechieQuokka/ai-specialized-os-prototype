@@ -18,6 +18,17 @@ readonly LABEL="minimal-gentoo"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly PROJECT_DIR="${SCRIPT_DIR%/scripts}"
 
+# Pinned, because an unpinned `pip install torch` silently changes what is
+# being measured. On 2026-09-18 it gave this side torch 2.14.0 / Python 3.14
+# / cuDNN 9.2.4 against a baseline taken the day before on torch 2.11.0 /
+# Python 3.11 / cuDNN 9.1.9 - three torch releases and a cuDNN bump inside
+# what was supposed to be a kernel-only comparison. The +59% pageable-H2D
+# result from that run cannot be attributed to the kernel for exactly this
+# reason.
+#
+# Moving this pin invalidates every existing baseline. Re-take both sides.
+readonly TORCH_VERSION="${TORCH_VERSION:-2.14.0}"
+
 die() { printf '\nABORT: %s\n' "$*" >&2; exit 1; }
 say() { printf '\n==> %s\n' "$*"; }
 ok()  { printf '  [ OK ] %s\n' "$*"; }
@@ -168,12 +179,28 @@ PIP_FLAGS=()
 python3 -c 'import sys,sysconfig,os; sys.exit(0 if os.path.exists(os.path.join(sysconfig.get_path("stdlib"),"EXTERNALLY-MANAGED")) else 1)' \
     && PIP_FLAGS+=(--break-system-packages) || true
 
-if ! python3 -c 'import torch' 2>/dev/null; then
-    say "Installing torch (large download - the CUDA runtime ships inside the wheel)"
-    python3 -m pip install "${PIP_FLAGS[@]}" torch nvidia-ml-py || die "torch install failed"
+# The wheel tag carries a local version ("2.14.0+cu130"), so compare only the
+# public part against the pin.
+installed_torch="$(python3 -c 'import torch; print(torch.__version__)' 2>/dev/null || true)"
+
+if [ -z "$installed_torch" ]; then
+    say "Installing torch ${TORCH_VERSION} (large download - the CUDA runtime ships inside the wheel)"
+    python3 -m pip install "${PIP_FLAGS[@]}" "torch==${TORCH_VERSION}" nvidia-ml-py \
+        || die "torch install failed"
+elif [ "${installed_torch%%+*}" != "$TORCH_VERSION" ]; then
+    say "Replacing torch ${installed_torch} with the pinned ${TORCH_VERSION}"
+    echo "  the installed version is not the one this comparison was calibrated on"
+    python3 -m pip install "${PIP_FLAGS[@]}" "torch==${TORCH_VERSION}" nvidia-ml-py \
+        || die "torch install failed"
 else
-    ok "torch already installed"
+    ok "torch ${installed_torch} already installed (matches the pin)"
 fi
+
+# Verify rather than assume: pip can resolve to something else entirely when
+# the pinned version has no wheel for this Python.
+final_torch="$(python3 -c 'import torch; print(torch.__version__)' 2>/dev/null || true)"
+[ "${final_torch%%+*}" = "$TORCH_VERSION" ] \
+    || die "torch is ${final_torch:-absent}, expected ${TORCH_VERSION} - results would not be comparable"
 
 python3 - <<'EOF'
 import torch
