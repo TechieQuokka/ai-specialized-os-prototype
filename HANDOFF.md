@@ -630,6 +630,22 @@ The ESP carries the same kernel twice, on purpose:
 `root=` must use **PARTUUID** and `/etc/fstab` must use the **filesystem
 UUID**. They are not interchangeable — see "Decisions" below.
 
+### The kernel configuration is in the repository now, not only on the disk
+
+Every copy of the config that produced the sixteen measured runs lived on `sdc`
+— on the ESP as `\EFI\Gentoo\config-6.18.48-gentoo`, in the root filesystem at
+`/boot/config-6.18.48-gentoo`, and in `/root`. None of them was ever committed,
+and `sdc` is the install target of the successor project, which reclaims it. It
+is now tracked at `kernel/config-6.18.48-gentoo.minimal`, copied out of
+`/root/kernel-config-6.18.48-gentoo.minimal` before the disk was reclaimed.
+
+`05_configure_kernel.sh` regenerates it, so the file is not irreplaceable in
+principle. It is kept because the measurements are only interpretable against
+the configuration that actually booted, and a regenerated config is a claim
+about that rather than a record of it. Its identity is checked rather than
+assumed: 1,457 `=y` plus 2 `=m` is the 1,459 options quoted throughout this
+file and in README.
+
 ---
 
 ## Scripts
